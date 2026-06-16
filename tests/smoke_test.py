@@ -52,7 +52,8 @@ tasks = [
 
 time_in_status = {
     "t1": {
-        "current_status": {"status": "done", "type": "closed", "total_time": {"by_minute": 0}},
+        # Status terminal dengan durasi besar -> HARUS dikecualikan dari bottleneck.
+        "current_status": {"status": "done", "type": "closed", "total_time": {"by_minute": 99999}},
         "status_history": [
             {"status": "to do", "type": "open", "total_time": {"by_minute": 1440}},      # 1 hari
             {"status": "in progress", "type": "custom", "total_time": {"by_minute": 2880}},  # 2 hari aktif
@@ -106,6 +107,9 @@ assert by_name["Budi"].cycle_median == 1.75, by_name["Budi"].cycle_median
 top = data.status_flow[0]
 assert top.status == "Review", top.status
 assert top.median_hours > 0 and top.p90_hours >= top.median_hours, (top.median_hours, top.p90_hours)
+# Status terminal (Done/Closed) harus dikecualikan walau durasinya besar.
+flow_names = {b.status for b in data.status_flow}
+assert "Done" not in flow_names, flow_names
 # Estimasi akurasi Budi: tracked 10j / estimate 12j = 0.83
 assert by_name["Budi"].estimate_accuracy == 0.83, by_name["Budi"].estimate_accuracy
 

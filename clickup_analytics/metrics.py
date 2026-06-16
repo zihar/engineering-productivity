@@ -15,6 +15,10 @@ from datetime import datetime, timedelta, timezone
 MS_PER_HOUR = 3_600_000
 MS_PER_DAY = 86_400_000
 
+# Tipe status terminal di ClickUp — bukan bottleneck (hanya "waktu sejak selesai"),
+# jadi dikecualikan dari analisis status flow.
+TERMINAL_STATUS_TYPES = {"closed", "done"}
+
 
 # --------------------------------------------------------------------- helpers
 def to_int_ms(value) -> int | None:
@@ -156,12 +160,19 @@ def build_report_data(
     status_flow: dict[str, StatusBucket] = {}
     deep = time_in_status is not None
     filtered_stale = 0
+    # Nama status terminal dikumpulkan dari field status task (punya 'type' valid).
+    # current_status di time_in_status sering bertype None, jadi nama lebih andal.
+    terminal_names: set[str] = set()
 
     for task in tasks:
         date_created = to_int_ms(task.get("date_created"))
         date_done = to_int_ms(task.get("date_done")) or to_int_ms(task.get("date_closed"))
         if date_done is None:
             continue  # hanya hitung task yang benar-benar selesai
+
+        st = task.get("status") or {}
+        if (st.get("type") or "").lower() in TERMINAL_STATUS_TYPES:
+            terminal_names.add((st.get("status") or "").title())
 
         lead_days = None
         if date_created is not None and date_done >= date_created:
@@ -208,6 +219,10 @@ def build_report_data(
         if dur > 0:  # abaikan timer berjalan / nilai negatif
             stats[uid].tracked_ms += dur
 
+    # Buang status terminal (mis. Done/Drop) yang lolos lewat current_status bertype None.
+    for name in terminal_names:
+        status_flow.pop(name, None)
+
     engineers_sorted = sorted(stats.values(), key=lambda e: e.completed, reverse=True)
     # Urut berdasarkan median (lebih tahan outlier) — bottleneck tipikal di atas.
     flow_sorted = sorted(status_flow.values(), key=lambda b: b.median_hours, reverse=True)
@@ -253,6 +268,8 @@ def _accumulate_status_flow(task: dict, time_in_status: dict[str, dict], flow: d
     if current:
         entries.append(current)
     for entry in entries:
+        if (entry.get("type") or "").lower() in TERMINAL_STATUS_TYPES:
+            continue  # lewati status terminal (Done/Closed/Drop) — bukan bottleneck
         name = (entry.get("status") or "unknown").title()
         ms = _status_entry_ms(entry)
         if ms <= 0:

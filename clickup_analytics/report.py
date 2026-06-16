@@ -82,7 +82,8 @@ def _status_flow_table(lines: list[str], data: ReportData) -> None:
     lines.append(
         "Lama task berada di tiap status (semua task pada periode), diurutkan dari "
         "**median** tertinggi. Median lebih tahan outlier daripada rata-rata; selisih "
-        "besar antara median dan p90/rata-rata menandakan ada beberapa task ekstrem."
+        "besar antara median dan p90/rata-rata menandakan ada beberapa task ekstrem. "
+        "Status terminal (Done/Closed/Drop) dikecualikan karena bukan bottleneck."
     )
     lines.append("")
     if not data.status_flow:
