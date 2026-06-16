@@ -108,6 +108,24 @@ python -m engineering_productivity --since 2026-05-01 --until 2026-05-31 --deep 
 | `--deep` | off | Ambil `time_in_status` per task → cycle time & bottleneck |
 | `-o`, `--output` | `reports/report.md` | File output |
 
+## Dashboard interaktif
+
+Selain laporan Markdown, ada dashboard Streamlit untuk eksplorasi:
+
+```bash
+pip install -r requirements.txt
+export CLICKUP_TOKEN=pk_...        # dan GITLAB_TOKEN=glpat-... bila pakai sumber GitLab
+streamlit run dashboard.py
+```
+
+Fitur: filter periode & engineer, toggle `deep`/filter task basi/sumber commit/filter noise,
+KPI ringkas, chart throughput & hari-aktif, **matriks Task vs Commit** interaktif (Plotly),
+tabel bottleneck, dan tombol unduh laporan Markdown. Tombol **Refresh data** mengosongkan cache.
+Dashboard memakai pipeline yang sama dengan CLI (`engineering_productivity.pipeline.gather_report`).
+
+> Jalankan hanya di localhost — berisi data produktivitas karyawan. `deep` & filter noise
+> membuat tiap interaksi lebih lambat (default keduanya OFF; hasil di-cache).
+
 ## Catatan akurasi
 
 - **Shared credit:** task dengan banyak assignee dihitung untuk tiap engineer yang ditugaskan.
@@ -124,9 +142,13 @@ python -m engineering_productivity --since 2026-05-01 --until 2026-05-31 --deep 
 engineering_productivity/
   config.py     # muat & validasi config.yaml (+ token dari env)
   client.py     # klien ClickUp REST API v2 (paginasi + retry rate limit)
+  db.py         # sumber commit dari DB squad-scorecard
+  gitlab.py     # sumber commit live dari GitLab API (+ auto-discover, filter noise)
   metrics.py    # perhitungan throughput, lead/cycle time, time tracked, status flow
+  pipeline.py   # orkestrasi reusable (dipakai CLI & dashboard)
   report.py     # render Markdown
   __main__.py   # CLI
+dashboard.py    # dashboard Streamlit (streamlit run dashboard.py)
 ```
 
 ## Lisensi
