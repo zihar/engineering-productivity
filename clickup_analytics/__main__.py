@@ -192,10 +192,11 @@ def main(argv: list[str] | None = None) -> int:
             time_entries = []
 
         commit_stats = None
-        commit_through = commit_synced_at = None
+        commit_through = commit_synced_at = commit_source = None
         source = "none" if args.no_commits else _resolve_commit_source(args.commits_source, config)
 
         if source == "gitlab":
+            commit_source = "GitLab API (live)"
             print(f"[*] Menarik commit langsung dari GitLab API ({len(config.gitlab.projects)} repo) ...")
             try:
                 gl = GitLabClient(config.gitlab.url, config.gitlab.token)
@@ -208,6 +209,7 @@ def main(argv: list[str] | None = None) -> int:
                 print(f"    [!] Commit GitLab dilewati: {exc}", file=sys.stderr)
                 commit_stats = None
         elif source == "db":
+            commit_source = "DB squad-scorecard"
             print("[*] Menarik aktivitas commit dari DB squad-scorecard ...")
             try:
                 commit_stats = db_fetch_commit_stats(
@@ -237,6 +239,7 @@ def main(argv: list[str] | None = None) -> int:
             commit_stats=commit_stats,
             commit_through=commit_through,
             commit_synced_at=commit_synced_at,
+            commit_source=commit_source,
         )
 
         markdown = render_markdown(data, generated_at=now.strftime("%Y-%m-%d %H:%M %Z"))

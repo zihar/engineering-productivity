@@ -45,7 +45,7 @@ def render_markdown(data: ReportData, *, generated_at: str) -> str:
     _summary_table(lines, data.engineers)
     _throughput_table(lines, data)
     if data.has_commit_data:
-        _commit_table(lines, data.engineers)
+        _commit_table(lines, data.engineers, data.commit_source)
         _quadrant_table(lines, data.engineers)
     if data.deep:
         _status_flow_table(lines, data)
@@ -89,11 +89,11 @@ def _throughput_table(lines: list[str], data: ReportData) -> None:
     lines.append("")
 
 
-def _commit_table(lines: list[str], engineers: list[EngineerStats]) -> None:
+def _commit_table(lines: list[str], engineers: list[EngineerStats], source: str | None) -> None:
     lines.append("## Aktivitas Commit (GitLab)")
     lines.append("")
     lines.append(
-        "Dari DB squad-scorecard. **Hari aktif** (jumlah hari ada commit) lebih bermakna "
+        f"Sumber: {source or 'GitLab'}. **Hari aktif** (jumlah hari ada commit) lebih bermakna "
         "daripada total commit yang mudah diakali. Bandingkan dengan kolom *Selesai* di "
         "ringkasan: timpang besar = task ClickUp tidak mencerminkan kerja kode (atau sebaliknya)."
     )
