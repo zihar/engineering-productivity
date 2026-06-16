@@ -24,6 +24,7 @@ class GitlabConfig:
     token: str
     projects: list[str]
     aliases: dict[str, str] = field(default_factory=dict)  # alias_email -> canonical_email
+    noise_patterns: list[str] = field(default_factory=list)  # tambahan pola file noise
 
 
 @dataclass
@@ -109,4 +110,5 @@ def _parse_gitlab(section: dict) -> GitlabConfig | None:
         str(k).lower(): str(v).lower()
         for k, v in (section.get("aliases") or {}).items()
     }
-    return GitlabConfig(url=url, token=gl_token, projects=projects, aliases=aliases)
+    noise = [str(p) for p in (section.get("noise_patterns") or [])]
+    return GitlabConfig(url=url, token=gl_token, projects=projects, aliases=aliases, noise_patterns=noise)

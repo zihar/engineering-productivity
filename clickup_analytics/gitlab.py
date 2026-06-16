@@ -8,6 +8,7 @@ Dok API: https://docs.gitlab.com/ee/api/commits.html
 
 from __future__ import annotations
 
+import fnmatch
 import time
 from datetime import date, timedelta
 from urllib.parse import quote
@@ -17,6 +18,47 @@ import requests
 from .models import CommitStats
 
 PER_PAGE = 100
+
+# File yang tidak mencerminkan "kerja kode" — dikecualikan saat --exclude-noise
+# agar metrik +/- baris bermakna (bukan dependency/generated/lockfile).
+DEFAULT_NOISE_PATTERNS = [
+    "vendor/*", "*/vendor/*",
+    "node_modules/*", "*/node_modules/*",
+    "*.lock", "go.sum", "*-lock.json", "*-lock.yaml", "*.lock.json",
+    "package-lock.json", "yarn.lock", "pnpm-lock.yaml", "composer.lock",
+    "*.pb.go", "*.pb.*.go", "*_gen.go", "*.gen.go", "*.generated.*",
+    "*_mock.go", "mocks/*", "*/mocks/*",
+    "dist/*", "*/dist/*", "build/*", "*/build/*",
+    "*.min.js", "*.min.css", "*.map", "*.snap",
+]
+
+
+def is_noise(path: str, patterns: list[str]) -> bool:
+    base = path.rsplit("/", 1)[-1]
+    return any(fnmatch.fnmatch(path, p) or fnmatch.fnmatch(base, p) for p in patterns)
+
+
+def _diff_line_counts(diff_text: str) -> tuple[int, int]:
+    adds = dels = 0
+    for line in diff_text.split("\n"):
+        if line.startswith("+") and not line.startswith("+++"):
+            adds += 1
+        elif line.startswith("-") and not line.startswith("---"):
+            dels += 1
+    return adds, dels
+
+
+def clean_diff_stats(diffs: list[dict], patterns: list[str]) -> tuple[int, int]:
+    """Hitung +/- baris dari daftar diff, mengecualikan file yang cocok pola noise."""
+    adds = dels = 0
+    for f in diffs:
+        path = f.get("new_path") or f.get("old_path") or ""
+        if is_noise(path, patterns):
+            continue
+        a, d = _diff_line_counts(f.get("diff") or "")
+        adds += a
+        dels += d
+    return adds, dels
 
 
 class GitLabError(Exception):
@@ -100,6 +142,24 @@ class GitLabClient:
                 break
             page += 1
 
+    def get_commit_diff(self, project: str, sha: str) -> list[dict]:
+        """Diff per file untuk satu commit (dipakai filter noise)."""
+        pid = quote(str(project), safe="")
+        out: list[dict] = []
+        page = 1
+        while True:
+            data = self._get(
+                f"/api/v4/projects/{pid}/repository/commits/{sha}/diff",
+                {"per_page": PER_PAGE, "page": page},
+            )
+            if not data:
+                break
+            out.extend(data)
+            if len(data) < PER_PAGE:
+                break
+            page += 1
+        return out
+
 
 def discover_project_ids(
     client: GitLabClient,
@@ -149,20 +209,27 @@ def fetch_commit_stats(
     since_date: str,
     until_date: str,
     *,
+    exclude_noise: bool = False,
+    noise_patterns: list[str] | None = None,
     on_warn=None,
+    on_progress=None,
 ) -> dict[int, CommitStats]:
     """Agregasi commit per engineer dari GitLab. Key hasil = id ClickUp (int).
 
     email_to_engineer memetakan email penulis commit (lowercase, termasuk alias)
     ke id engineer ClickUp. Commit dari email tak dikenal diabaikan.
+
+    exclude_noise=True mengambil diff tiap commit (mahal: 1 call/commit) dan
+    menghitung ulang +/- baris hanya dari file non-noise.
     """
     since_iso = f"{since_date}T00:00:00Z"
     until_iso = f"{until_date}T23:59:59Z"
+    patterns = DEFAULT_NOISE_PATTERNS + list(noise_patterns or []) if exclude_noise else []
     acc: dict[int, dict] = {}
 
     for project in projects:
         try:
-            for c in client.iter_commits(project, since_iso, until_iso):
+            for c in client.iter_commits(project, since_iso, until_iso, with_stats=not exclude_noise):
                 email = (c.get("author_email") or "").lower()
                 eng = email_to_engineer.get(email)
                 if eng is None:
@@ -173,9 +240,22 @@ def fetch_commit_stats(
                     continue  # commit yang sama muncul di banyak branch
                 a["shas"].add(sha)
                 a["commits"] += 1
-                stats = c.get("stats") or {}
-                a["additions"] += int(stats.get("additions") or 0)
-                a["deletions"] += int(stats.get("deletions") or 0)
+                if exclude_noise:
+                    try:
+                        diffs = client.get_commit_diff(project, sha)
+                        adds, dels = clean_diff_stats(diffs, patterns)
+                    except GitLabError as exc:
+                        adds = dels = 0
+                        if on_warn:
+                            on_warn(f"diff {str(sha)[:8]}: {exc}")
+                    a["additions"] += adds
+                    a["deletions"] += dels
+                    if on_progress:
+                        on_progress()
+                else:
+                    stats = c.get("stats") or {}
+                    a["additions"] += int(stats.get("additions") or 0)
+                    a["deletions"] += int(stats.get("deletions") or 0)
                 day = (c.get("committed_date") or c.get("created_at") or "")[:10]
                 if day:
                     a["days"].add(day)

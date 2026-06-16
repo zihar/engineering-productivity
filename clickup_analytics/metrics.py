@@ -147,6 +147,7 @@ class ReportData:
     commit_through: str | None = None
     commit_synced_at: str | None = None
     commit_source: str | None = None
+    commit_noise_filtered: bool = False
 
 
 # --------------------------------------------------------------------- builder
@@ -165,6 +166,7 @@ def build_report_data(
     commit_through: str | None = None,
     commit_synced_at: str | None = None,
     commit_source: str | None = None,
+    commit_noise_filtered: bool = False,
 ) -> ReportData:
     stats: dict[int, EngineerStats] = {
         uid: EngineerStats(engineer_id=uid, name=id_to_name.get(uid, str(uid)))
@@ -267,6 +269,7 @@ def build_report_data(
         commit_through=commit_through,
         commit_synced_at=commit_synced_at,
         commit_source=commit_source,
+        commit_noise_filtered=commit_noise_filtered,
     )
 
 

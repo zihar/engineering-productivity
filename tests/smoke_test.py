@@ -9,7 +9,12 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from clickup_analytics.db import CommitStats
-from clickup_analytics.gitlab import discover_project_ids
+from clickup_analytics.gitlab import (
+    DEFAULT_NOISE_PATTERNS,
+    clean_diff_stats,
+    discover_project_ids,
+    is_noise,
+)
 from clickup_analytics.gitlab import fetch_commit_stats as gl_fetch_commit_stats
 from clickup_analytics.metrics import build_report_data
 from clickup_analytics.report import render_markdown
@@ -176,6 +181,34 @@ disc = discover_project_ids(
     "2024-05-01", "2024-05-31",
 )
 assert disc == {"100", "3149", "200"}, disc  # union, dedup, user tak dikenal dilewati
+
+
+# --- Filter file noise ---
+assert is_noise("vendor/github.com/x/y.go", DEFAULT_NOISE_PATTERNS)
+assert is_noise("go.sum", DEFAULT_NOISE_PATTERNS)
+assert is_noise("api/service.pb.go", DEFAULT_NOISE_PATTERNS)
+assert not is_noise("internal/foo.go", DEFAULT_NOISE_PATTERNS)
+diffs = [
+    {"new_path": "main.go", "diff": "@@ -1 +1 @@\n+a\n+b\n-c\n"},  # 2 add, 1 del
+    {"new_path": "go.sum", "diff": "@@ -1 +1 @@\n+x\n+y\n"},      # noise -> dilewati
+]
+assert clean_diff_stats(diffs, DEFAULT_NOISE_PATTERNS) == (2, 1)
+
+
+class _FakeNoiseGL:
+    commits = {"100": [{"id": "c1", "author_email": "budi@x.com", "committed_date": "2024-05-02T01:00:00Z"}]}
+    diffs = {"c1": diffs}
+
+    def iter_commits(self, project, since_iso, until_iso, with_stats=True):
+        return iter(self.commits.get(str(project), []))
+
+    def get_commit_diff(self, project, sha):
+        return self.diffs.get(sha, [])
+
+
+nstats = gl_fetch_commit_stats(_FakeNoiseGL(), ["100"], {"budi@x.com": ID_BUDI}, "2024-05-01", "2024-05-31", exclude_noise=True)
+nb = nstats[ID_BUDI]
+assert (nb.commits, nb.additions, nb.deletions) == (1, 2, 1), (nb.commits, nb.additions, nb.deletions)
 
 # --- Filter --max-age: t3 (lead 5 hari) harus diabaikan bila max_age=3 ---
 data_capped = build_report_data(

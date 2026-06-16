@@ -45,7 +45,7 @@ def render_markdown(data: ReportData, *, generated_at: str) -> str:
     _summary_table(lines, data.engineers)
     _throughput_table(lines, data)
     if data.has_commit_data:
-        _commit_table(lines, data.engineers, data.commit_source)
+        _commit_table(lines, data.engineers, data.commit_source, data.commit_noise_filtered)
         _quadrant_table(lines, data.engineers)
     if data.deep:
         _status_flow_table(lines, data)
@@ -89,13 +89,18 @@ def _throughput_table(lines: list[str], data: ReportData) -> None:
     lines.append("")
 
 
-def _commit_table(lines: list[str], engineers: list[EngineerStats], source: str | None) -> None:
+def _commit_table(lines: list[str], engineers: list[EngineerStats], source: str | None, noise_filtered: bool) -> None:
     lines.append("## Aktivitas Commit (GitLab)")
     lines.append("")
+    baris_note = (
+        "+/- baris **sudah mengecualikan file noise** (vendor/lock/generated)."
+        if noise_filtered
+        else "+/- baris mentah (termasuk vendor/lock/generated — gunakan `--exclude-noise` untuk menyaring)."
+    )
     lines.append(
         f"Sumber: {source or 'GitLab'}. **Hari aktif** (jumlah hari ada commit) lebih bermakna "
         "daripada total commit yang mudah diakali. Bandingkan dengan kolom *Selesai* di "
-        "ringkasan: timpang besar = task ClickUp tidak mencerminkan kerja kode (atau sebaliknya)."
+        f"ringkasan: timpang besar = task ClickUp tidak mencerminkan kerja kode (atau sebaliknya). {baris_note}"
     )
     lines.append("")
     lines.append("| Engineer | Commits | Hari aktif | Repo | +Baris | -Baris |")

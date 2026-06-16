@@ -105,6 +105,8 @@ def build_parser() -> argparse.ArgumentParser:
                    help="Sumber commit: gitlab (live API), db (scorecard, bisa basi), auto (gitlab > db), none")
     p.add_argument("--no-discover", action="store_true",
                    help="(GitLab) jangan auto-discover repo per engineer; pakai daftar gitlab.projects saja")
+    p.add_argument("--exclude-noise", action="store_true",
+                   help="(GitLab) hitung +/- baris tanpa file noise (vendor/lock/generated); ambil diff tiap commit (lambat)")
     p.add_argument("-o", "--output", default="reports/report.md", help="File output Markdown")
     p.add_argument("--list-teams", action="store_true", help="Tampilkan workspace/team yang bisa diakses lalu keluar")
     p.add_argument("--list-members", action="store_true", help="Tampilkan member workspace lalu keluar")
@@ -212,10 +214,22 @@ def main(argv: list[str] | None = None) -> int:
                     )
                     print(f"    {len(discovered)} repo dari aktivitas push + {len(projects)} dari seed.")
                     projects |= discovered
-                print(f"[*] Menarik commit langsung dari GitLab API ({len(projects)} repo) ...")
+                noise_msg = " (filter noise: ambil diff tiap commit, agak lambat)" if args.exclude_noise else ""
+                print(f"[*] Menarik commit langsung dari GitLab API ({len(projects)} repo){noise_msg} ...")
                 email_map = _build_gitlab_email_map(config, members)
+                progress = {"n": 0}
+
+                def _tick():
+                    progress["n"] += 1
+                    if progress["n"] % 100 == 0:
+                        print(f"    ... {progress['n']} diff diproses", file=sys.stderr)
+
                 commit_stats = gl_fetch_commit_stats(
-                    gl, sorted(projects), email_map, since_str, until_str, on_warn=warn,
+                    gl, sorted(projects), email_map, since_str, until_str,
+                    exclude_noise=args.exclude_noise,
+                    noise_patterns=config.gitlab.noise_patterns,
+                    on_warn=warn,
+                    on_progress=_tick if args.exclude_noise else None,
                 )
             except GitLabError as exc:
                 print(f"    [!] Commit GitLab dilewati: {exc}", file=sys.stderr)
@@ -252,6 +266,7 @@ def main(argv: list[str] | None = None) -> int:
             commit_through=commit_through,
             commit_synced_at=commit_synced_at,
             commit_source=commit_source,
+            commit_noise_filtered=bool(commit_stats is not None and source == "gitlab" and args.exclude_noise),
         )
 
         markdown = render_markdown(data, generated_at=now.strftime("%Y-%m-%d %H:%M %Z"))
