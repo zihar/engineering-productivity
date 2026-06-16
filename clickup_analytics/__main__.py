@@ -130,14 +130,23 @@ def main(argv: list[str] | None = None) -> int:
                     print(f"    ... {i}/{len(tasks)}")
 
         print("[*] Menarik time entries ...")
-        time_entries = list(
-            client.iter_time_entries(
-                team_id,
-                start_date=date_done_gt,
-                end_date=date_done_lt,
-                assignee_ids=sorted(target_ids),
+        try:
+            time_entries = list(
+                client.iter_time_entries(
+                    team_id,
+                    start_date=date_done_gt,
+                    end_date=date_done_lt,
+                    assignee_ids=sorted(target_ids),
+                )
             )
-        )
+        except ClickUpError as exc:
+            # Membaca time entry orang lain butuh izin admin/owner workspace.
+            # Kalau token tak punya akses, lewati metrik time-tracked (bukan fatal).
+            print(
+                f"    [!] Time entries dilewati (metrik 'time tracked' kosong): {exc}",
+                file=sys.stderr,
+            )
+            time_entries = []
 
         data = build_report_data(
             tasks,
