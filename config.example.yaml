@@ -1,0 +1,18 @@
+# Salin file ini ke config.yaml lalu isi sesuai timmu.
+# config.yaml di-gitignore supaya token tidak ikut ter-commit.
+
+# Personal API token ClickUp (Settings -> Apps -> Generate, formatnya "pk_...").
+# Bisa juga lewat environment variable CLICKUP_TOKEN (lebih aman) -> kosongkan baris ini.
+token: ""
+
+# ID workspace/team ClickUp. Kalau dikosongkan, tool memakai team pertama
+# yang bisa diakses token-mu (jalankan dengan --list-teams untuk melihat daftarnya).
+team_id: ""
+
+# Daftar engineer yang mau dianalisis. Boleh pakai email ATAU id numerik.
+# Email akan di-resolve otomatis ke id lewat daftar member workspace.
+engineers:
+  - name: "Contoh Engineer A"
+    email: "engineer.a@example.com"
+  - name: "Contoh Engineer B"
+    id: 12345678
