@@ -1,0 +1,235 @@
+"""Perhitungan metrik produktivitas dari data mentah ClickUp.
+
+Semua waktu dari ClickUp dalam Unix epoch milidetik (string). Helper di sini
+mengubahnya ke jam/hari dan mengelompokkannya per engineer & per minggu.
+"""
+
+from __future__ import annotations
+
+import statistics
+from collections import defaultdict
+from dataclasses import dataclass, field
+from datetime import datetime, timedelta, timezone
+
+MS_PER_HOUR = 3_600_000
+MS_PER_DAY = 86_400_000
+
+
+# --------------------------------------------------------------------- helpers
+def to_int_ms(value) -> int | None:
+    if value in (None, "", "null"):
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def local_dt(ms: int, offset_hours: float) -> datetime:
+    tz = timezone(timedelta(hours=offset_hours))
+    return datetime.fromtimestamp(ms / 1000, tz=tz)
+
+
+def iso_week_label(ms: int, offset_hours: float) -> str:
+    dt = local_dt(ms, offset_hours)
+    year, week, _ = dt.isocalendar()
+    return f"{year}-W{week:02d}"
+
+
+def _median(values: list[float]) -> float:
+    return round(statistics.median(values), 2) if values else 0.0
+
+
+def _mean(values: list[float]) -> float:
+    return round(statistics.fmean(values), 2) if values else 0.0
+
+
+# --------------------------------------------------------------------- results
+@dataclass
+class EngineerStats:
+    engineer_id: int
+    name: str
+    completed: int = 0
+    lead_times_days: list[float] = field(default_factory=list)
+    cycle_times_days: list[float] = field(default_factory=list)
+    estimate_ms: int = 0
+    tracked_ms: int = 0
+    per_week: dict[str, int] = field(default_factory=lambda: defaultdict(int))
+
+    @property
+    def lead_median(self) -> float:
+        return _median(self.lead_times_days)
+
+    @property
+    def lead_mean(self) -> float:
+        return _mean(self.lead_times_days)
+
+    @property
+    def cycle_median(self) -> float:
+        return _median(self.cycle_times_days)
+
+    @property
+    def tracked_hours(self) -> float:
+        return round(self.tracked_ms / MS_PER_HOUR, 1)
+
+    @property
+    def estimate_hours(self) -> float:
+        return round(self.estimate_ms / MS_PER_HOUR, 1)
+
+    @property
+    def estimate_accuracy(self) -> float | None:
+        """Rasio tracked/estimate. >1 berarti lebih lama dari estimasi."""
+        if self.estimate_ms <= 0:
+            return None
+        return round(self.tracked_ms / self.estimate_ms, 2)
+
+
+@dataclass
+class StatusBucket:
+    status: str
+    total_ms: int = 0
+    count: int = 0
+
+    @property
+    def avg_hours(self) -> float:
+        return round(self.total_ms / self.count / MS_PER_HOUR, 1) if self.count else 0.0
+
+
+@dataclass
+class ReportData:
+    engineers: list[EngineerStats]
+    status_flow: list[StatusBucket]
+    weeks: list[str]
+    total_tasks: int
+    deep: bool
+    since: str
+    until: str
+    tz_offset: float
+
+
+# --------------------------------------------------------------------- builder
+def build_report_data(
+    tasks: list[dict],
+    *,
+    id_to_name: dict[int, str],
+    target_ids: set[int],
+    time_in_status: dict[str, dict] | None,
+    time_entries: list[dict],
+    since: str,
+    until: str,
+    tz_offset: float,
+) -> ReportData:
+    stats: dict[int, EngineerStats] = {
+        uid: EngineerStats(engineer_id=uid, name=id_to_name.get(uid, str(uid)))
+        for uid in target_ids
+    }
+    weeks: set[str] = set()
+    status_flow: dict[str, StatusBucket] = {}
+    deep = time_in_status is not None
+
+    for task in tasks:
+        date_created = to_int_ms(task.get("date_created"))
+        date_done = to_int_ms(task.get("date_done")) or to_int_ms(task.get("date_closed"))
+        if date_done is None:
+            continue  # hanya hitung task yang benar-benar selesai
+
+        assignees = task.get("assignees") or []
+        relevant = [a for a in assignees if a.get("id") in target_ids]
+        if not relevant:
+            continue
+
+        week = iso_week_label(date_done, tz_offset)
+        weeks.add(week)
+
+        lead_days = None
+        if date_created is not None and date_done >= date_created:
+            lead_days = round((date_done - date_created) / MS_PER_DAY, 2)
+
+        cycle_days = None
+        if deep:
+            cycle_days = _cycle_time_days(task, time_in_status)
+            _accumulate_status_flow(task, time_in_status, status_flow)
+
+        estimate = to_int_ms(task.get("time_estimate")) or 0
+
+        for a in relevant:
+            s = stats[a["id"]]
+            s.completed += 1
+            s.per_week[week] += 1
+            s.estimate_ms += estimate
+            if lead_days is not None:
+                s.lead_times_days.append(lead_days)
+            if cycle_days is not None:
+                s.cycle_times_days.append(cycle_days)
+
+    # Time tracked per engineer dari entri time-tracking (akurat per orang).
+    for entry in time_entries:
+        user = entry.get("user") or {}
+        uid = user.get("id")
+        if uid not in stats:
+            continue
+        dur = to_int_ms(entry.get("duration")) or 0
+        if dur > 0:  # abaikan timer berjalan / nilai negatif
+            stats[uid].tracked_ms += dur
+
+    engineers_sorted = sorted(stats.values(), key=lambda e: e.completed, reverse=True)
+    flow_sorted = sorted(status_flow.values(), key=lambda b: b.avg_hours, reverse=True)
+
+    return ReportData(
+        engineers=engineers_sorted,
+        status_flow=flow_sorted,
+        weeks=sorted(weeks),
+        total_tasks=sum(e.completed for e in engineers_sorted),
+        deep=deep,
+        since=since,
+        until=until,
+        tz_offset=tz_offset,
+    )
+
+
+def _cycle_time_days(task: dict, time_in_status: dict[str, dict]) -> float | None:
+    """Cycle time = total waktu di status aktif (type 'custom'), mis. In Progress, Review.
+
+    Status 'open' (backlog/to-do) dan 'closed/done' dikecualikan agar mengukur
+    waktu pengerjaan nyata, bukan waktu menunggu di backlog.
+    """
+    tis = time_in_status.get(task["id"])
+    if not tis:
+        return None
+    total_ms = 0
+    history = tis.get("status_history", [])
+    for entry in history:
+        status_type = (entry.get("type") or "").lower()
+        if status_type == "custom":
+            total_ms += _status_entry_ms(entry)
+    return round(total_ms / MS_PER_DAY, 2) if total_ms else 0.0
+
+
+def _accumulate_status_flow(task: dict, time_in_status: dict[str, dict], flow: dict[str, StatusBucket]) -> None:
+    tis = time_in_status.get(task["id"])
+    if not tis:
+        return
+    entries = list(tis.get("status_history", []))
+    current = tis.get("current_status")
+    if current:
+        entries.append(current)
+    for entry in entries:
+        name = (entry.get("status") or "unknown").title()
+        ms = _status_entry_ms(entry)
+        if ms <= 0:
+            continue
+        bucket = flow.setdefault(name, StatusBucket(status=name))
+        bucket.total_ms += ms
+        bucket.count += 1
+
+
+def _status_entry_ms(entry: dict) -> int:
+    """ClickUp menaruh durasi di total_time.by_minute (menit) atau total_time.since (ms)."""
+    total = entry.get("total_time") or {}
+    by_minute = total.get("by_minute")
+    if by_minute is not None:
+        try:
+            return int(by_minute) * 60_000
+        except (TypeError, ValueError):
+            return 0
+    return to_int_ms(total.get("since")) or 0
