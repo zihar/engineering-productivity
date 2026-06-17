@@ -1,0 +1,146 @@
+"""Lapisan persistensi Postgres (cache) untuk data mahal & immutable.
+
+Menyimpan:
+  - time_in_status per task (done = immutable → aman dicache permanen)
+  - commit per sha + rentang yang sudah ter-cover per project (untuk fetch incremental)
+
+Opsional: bila DSN tak diset / DB tak terjangkau, pipeline fallback ke tarikan live.
+Diakses lewat antarmuka kecil sehingga bisa di-fake saat test tanpa Postgres.
+"""
+
+from __future__ import annotations
+
+try:
+    import psycopg
+    from psycopg.types.json import Json
+except ImportError:  # driver opsional
+    psycopg = None
+    Json = None
+
+
+class StoreError(Exception):
+    pass
+
+
+_SCHEMA = """
+CREATE TABLE IF NOT EXISTS ep_time_in_status (
+    task_id    TEXT PRIMARY KEY,
+    payload    JSONB NOT NULL,
+    fetched_at timestamptz NOT NULL DEFAULT now()
+);
+CREATE TABLE IF NOT EXISTS ep_commits (
+    sha            TEXT PRIMARY KEY,
+    project_id     TEXT NOT NULL,
+    author_email   TEXT,
+    committed_date timestamptz,
+    additions      INT NOT NULL DEFAULT 0,
+    deletions      INT NOT NULL DEFAULT 0,
+    fetched_at     timestamptz NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS ep_commits_proj_date ON ep_commits (project_id, committed_date);
+CREATE TABLE IF NOT EXISTS ep_commit_sync (
+    project_id     TEXT PRIMARY KEY,
+    earliest_date  DATE NOT NULL,
+    latest_date    DATE NOT NULL
+);
+"""
+
+
+class Store:
+    def __init__(self, conn):
+        self.conn = conn
+
+    @classmethod
+    def connect(cls, dsn: str) -> "Store":
+        if psycopg is None:
+            raise StoreError("Driver psycopg tidak terpasang.")
+        try:
+            conn = psycopg.connect(dsn, connect_timeout=10)
+            store = cls(conn)
+            store.ensure_schema()
+            return store
+        except psycopg.Error as exc:  # type: ignore[union-attr]
+            raise StoreError(str(exc)) from exc
+
+    def ensure_schema(self) -> None:
+        with self.conn.cursor() as cur:
+            cur.execute(_SCHEMA)
+        self.conn.commit()
+
+    # ---------------------------------------------------------- time_in_status
+    def get_time_in_status(self, task_ids: list[str]) -> dict[str, dict]:
+        if not task_ids:
+            return {}
+        with self.conn.cursor() as cur:
+            cur.execute(
+                "SELECT task_id, payload FROM ep_time_in_status WHERE task_id = ANY(%s)",
+                (list(task_ids),),
+            )
+            return {tid: payload for tid, payload in cur.fetchall()}
+
+    def put_time_in_status(self, task_id: str, payload: dict) -> None:
+        with self.conn.cursor() as cur:
+            cur.execute(
+                """INSERT INTO ep_time_in_status (task_id, payload) VALUES (%s, %s)
+                   ON CONFLICT (task_id) DO UPDATE SET payload = EXCLUDED.payload, fetched_at = now()""",
+                (task_id, Json(payload)),
+            )
+
+    # ----------------------------------------------------------------- commits
+    def get_commit_coverage(self, project_id: str) -> tuple[str, str] | None:
+        with self.conn.cursor() as cur:
+            cur.execute(
+                "SELECT earliest_date::text, latest_date::text FROM ep_commit_sync WHERE project_id = %s",
+                (project_id,),
+            )
+            row = cur.fetchone()
+            return (row[0], row[1]) if row else None
+
+    def set_commit_coverage(self, project_id: str, earliest: str, latest: str) -> None:
+        with self.conn.cursor() as cur:
+            cur.execute(
+                """INSERT INTO ep_commit_sync (project_id, earliest_date, latest_date) VALUES (%s, %s, %s)
+                   ON CONFLICT (project_id) DO UPDATE
+                   SET earliest_date = LEAST(ep_commit_sync.earliest_date, EXCLUDED.earliest_date),
+                       latest_date   = GREATEST(ep_commit_sync.latest_date, EXCLUDED.latest_date)""",
+                (project_id, earliest, latest),
+            )
+
+    def upsert_commits(self, rows: list[dict]) -> None:
+        if not rows:
+            return
+        with self.conn.cursor() as cur:
+            cur.executemany(
+                """INSERT INTO ep_commits (sha, project_id, author_email, committed_date, additions, deletions)
+                   VALUES (%(sha)s, %(project_id)s, %(author_email)s, %(committed_date)s, %(additions)s, %(deletions)s)
+                   ON CONFLICT (sha) DO NOTHING""",
+                rows,
+            )
+
+    def get_commits(self, project_ids: list[str], since_date: str, until_date: str) -> list[dict]:
+        if not project_ids:
+            return []
+        with self.conn.cursor() as cur:
+            cur.execute(
+                """SELECT sha, project_id, author_email, committed_date::text, additions, deletions
+                   FROM ep_commits
+                   WHERE project_id = ANY(%s)
+                     AND committed_date >= %s::date
+                     AND committed_date < (%s::date + INTERVAL '1 day')""",
+                (list(project_ids), since_date, until_date),
+            )
+            return [
+                {"sha": s, "project_id": p, "author_email": e, "committed_date": d,
+                 "additions": a, "deletions": x}
+                for s, p, e, d, a, x in cur.fetchall()
+            ]
+
+    # ------------------------------------------------------------------- misc
+    def commit(self) -> None:
+        self.conn.commit()
+
+    def close(self) -> None:
+        try:
+            self.conn.close()
+        except Exception:  # noqa: BLE001
+            pass

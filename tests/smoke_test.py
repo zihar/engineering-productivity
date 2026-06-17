@@ -19,7 +19,15 @@ from engineering_productivity.gitlab import (
 from engineering_productivity.gitlab import fetch_commit_stats as gl_fetch_commit_stats
 from engineering_productivity.config import Config, Engineer, GitlabConfig
 from engineering_productivity.metrics import build_report_data
-from engineering_productivity.pipeline import GatherOptions, resolve_commit_source, resolve_targets
+from engineering_productivity.pipeline import (
+    GatherOptions,
+    _aggregate_commit_rows,
+    _commits_via_store,
+    _coverage_gaps,
+    _fetch_time_in_status,
+    resolve_commit_source,
+    resolve_targets,
+)
 from engineering_productivity.report import render_markdown
 
 # Dua engineer dummy.
@@ -297,6 +305,93 @@ util2 = build_report_data(
     commit_stats=util_commits, open_tasks={1: 10, 2: 5, 3: 1}, utilization=True,
 )
 assert "story point" not in util2.utilization_signals, util2.utilization_signals
+
+# --- Cache DB (Fase 1): coverage gaps, agregasi, dan reuse time_in_status ---
+assert _coverage_gaps(None, "2024-05-01", "2024-05-31") == [("2024-05-01", "2024-05-31")]
+assert _coverage_gaps(("2024-05-01", "2024-05-31"), "2024-05-01", "2024-05-31") == []  # full cover
+assert _coverage_gaps(("2024-05-10", "2024-05-20"), "2024-05-01", "2024-05-31") == [
+    ("2024-05-01", "2024-05-10"), ("2024-05-20", "2024-05-31")]
+
+agg = _aggregate_commit_rows([
+    {"sha": "s1", "project_id": "10", "author_email": "Budi@x.com", "committed_date": "2024-05-02T01:00:00Z", "additions": 5, "deletions": 1},
+    {"sha": "s1", "project_id": "10", "author_email": "budi@x.com", "committed_date": "2024-05-02T01:00:00Z", "additions": 5, "deletions": 1},  # dup sha
+    {"sha": "s2", "project_id": "20", "author_email": "budi@x.com", "committed_date": "2024-05-03T01:00:00Z", "additions": 2, "deletions": 0},
+], {"budi@x.com": ID_BUDI})
+ab = agg[ID_BUDI]
+assert (ab.commits, ab.additions, ab.active_days, ab.repos) == (2, 7, 2, 2), (ab.commits, ab.additions, ab.active_days, ab.repos)
+
+
+class _FakeStore:
+    def __init__(self, tis=None):
+        self.tis = dict(tis or {})
+        self.puts = 0
+        self.commits = {}
+        self.coverage = {}
+
+    def get_time_in_status(self, ids):
+        return {i: self.tis[i] for i in ids if i in self.tis}
+
+    def put_time_in_status(self, tid, payload):
+        self.tis[tid] = payload
+        self.puts += 1
+
+    def get_commit_coverage(self, pid):
+        return self.coverage.get(pid)
+
+    def set_commit_coverage(self, pid, e, l):
+        cur = self.coverage.get(pid)
+        if cur:
+            e, l = min(cur[0], e), max(cur[1], l)
+        self.coverage[pid] = (e, l)
+
+    def upsert_commits(self, rows):
+        for r in rows:
+            self.commits.setdefault(r["sha"], r)
+
+    def get_commits(self, pids, since, until):
+        ps = set(pids)
+        return [r for r in self.commits.values()
+                if r["project_id"] in ps and since <= (r["committed_date"] or "")[:10] <= until]
+
+    def commit(self):
+        pass
+
+
+class _CountingClient:
+    def __init__(self):
+        self.calls = 0
+
+    def get_time_in_status(self, tid):
+        self.calls += 1
+        return {"current_status": {"status": "done", "type": "closed", "total_time": {"by_minute": 0}}, "status_history": []}
+
+
+# Task t1 sudah ada di cache → tidak dipanggil; t2 miss → ditarik & disimpan.
+_store = _FakeStore(tis={"t1": {"status_history": []}})
+_client = _CountingClient()
+tis_out = _fetch_time_in_status(_client, [{"id": "t1"}, {"id": "t2"}], _store, lambda m: None)
+assert set(tis_out) == {"t1", "t2"}, tis_out
+assert _client.calls == 1, _client.calls          # hanya t2 ditarik
+assert _store.puts == 1 and "t2" in _store.tis     # t2 disimpan ke cache
+
+
+class _GLForStore:
+    def __init__(self):
+        self.fetches = 0
+
+    def iter_commits(self, pid, since_iso, until_iso, with_stats=True):
+        self.fetches += 1
+        return [{"id": "c1", "author_email": "budi@x.com",
+                 "committed_date": "2024-05-05T00:00:00Z", "stats": {"additions": 3, "deletions": 1}}]
+
+
+_cstore, _gl = _FakeStore(), _GLForStore()
+_r1 = _commits_via_store(_gl, _cstore, ["10"], {"budi@x.com": ID_BUDI}, "2024-05-01", "2024-05-31", lambda m: None)
+assert _gl.fetches == 1 and _r1[ID_BUDI].commits == 1, (_gl.fetches, _r1)
+# Window sama lagi → sudah ter-cover → tidak ada fetch baru, hasil tetap dari cache
+_r2 = _commits_via_store(_gl, _cstore, ["10"], {"budi@x.com": ID_BUDI}, "2024-05-01", "2024-05-31", lambda m: None)
+assert _gl.fetches == 1, _gl.fetches
+assert _r2[ID_BUDI].commits == 1
 
 md = render_markdown(data, generated_at="2024-05-31 09:00 WIB")
 assert "Selesai terakhir" not in md  # kolom hanya muncul bila fitur aktif
