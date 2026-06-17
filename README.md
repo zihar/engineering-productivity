@@ -4,22 +4,22 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Python](https://img.shields.io/badge/python-3.11%2B-blue.svg)](https://www.python.org/)
 
-Tool Python untuk menganalisis produktivitas engineer dari data [ClickUp](https://clickup.com)
-lewat REST API. Menarik task per engineer (lintas space), menghitung metrik, lalu
-menghasilkan **laporan Markdown** siap di-share ke management.
+A Python tool for analyzing engineer productivity from [ClickUp](https://clickup.com) data
+via the REST API. It pulls tasks per engineer (across spaces), computes metrics, and then
+generates a **Markdown report** ready to share with management.
 
-## Metrik yang dihitung
+## Metrics computed
 
-| Metrik | Penjelasan |
+| Metric | Description |
 |---|---|
-| **Throughput** | Jumlah task selesai per engineer, dipecah per minggu (ISO week). |
-| **Lead time** | Waktu dari task dibuat → selesai (hari). Median & rata-rata. |
-| **Cycle time** | Waktu task berada di status aktif (mis. In Progress, Review). Butuh `--deep`. |
-| **Time tracked** | Jam time-tracking nyata per engineer vs estimasi, plus akurasi estimasi. |
-| **Status flow / bottleneck** | Median/p90 lama task nyangkut di tiap status (status terminal dikecualikan). Butuh `--deep`. |
-| **Aktivitas commit (GitLab)** | Commit, hari aktif, +/- baris, & repo per engineer. Sumber: GitLab API langsung (live). Opsional. |
-| **Matriks task vs commit** | Kuadran 2×2 (throughput ClickUp × hari aktif commit) untuk lihat pola disiplin task vs output kode. |
-| **Utilisasi (underutilized)** | Skor 0–100 relatif tim dari 4 sinyal (WIP, hari aktif commit, throughput, story point) untuk menandai engineer berkapasitas nganggur. Opsional. |
+| **Throughput** | Number of tasks completed per engineer, broken down per week (ISO week). |
+| **Lead time** | Time from task created → completed (days). Median & average. |
+| **Cycle time** | Time a task spends in active statuses (e.g. In Progress, Review). Requires `--deep`. |
+| **Time tracked** | Actual time-tracking hours per engineer vs estimate, plus estimation accuracy. |
+| **Status flow / bottleneck** | Median/p90 time a task lingers in each status (terminal statuses excluded). Requires `--deep`. |
+| **Commit activity (GitLab)** | Commits, active days, +/- lines, & repos per engineer. Source: GitLab API directly (live). Optional. |
+| **Task vs commit matrix** | A 2×2 quadrant (ClickUp throughput × commit active days) to spot patterns of task discipline vs code output. |
+| **Utilization (underutilized)** | A 0–100 score relative to the team from 4 signals (WIP, commit active days, throughput, story points) to flag engineers with idle capacity. Optional. |
 
 ## Setup
 
@@ -29,19 +29,19 @@ python3 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
 
-cp config.example.yaml config.yaml   # lalu isi daftar engineer
-export CLICKUP_TOKEN="pk_xxxxxxxx"    # token dari ClickUp: Settings -> Apps
+cp config.example.yaml config.yaml   # then fill in the list of engineers
+export CLICKUP_TOKEN="pk_xxxxxxxx"    # token from ClickUp: Settings -> Apps
 ```
 
-> Token sebaiknya lewat environment variable `CLICKUP_TOKEN`, bukan ditulis di
-> `config.yaml` (file itu sudah di-`.gitignore`).
+> The token should be provided via the `CLICKUP_TOKEN` environment variable, not written in
+> `config.yaml` (that file is already in `.gitignore`).
 
-## Konfigurasi
+## Configuration
 
-`config.yaml` cukup berisi daftar engineer (pakai email atau id numerik):
+`config.yaml` just needs a list of engineers (using email or numeric id):
 
 ```yaml
-team_id: ""               # opsional; kosongkan untuk pakai workspace pertama
+team_id: ""               # optional; leave empty to use the first workspace
 engineers:
   - name: "Budi"
     email: "budi@example.com"
@@ -49,130 +49,129 @@ engineers:
     id: 12345678
 ```
 
-### (Opsional) Aktivitas commit GitLab
+### (Optional) GitLab commit activity
 
-Commit selalu diambil dari **GitLab API** (live) bila GitLab terkonfigurasi; tanpa itu, metrik commit dilewati.
+Commits are always pulled from the **GitLab API** (live) when GitLab is configured; without that, commit metrics are skipped.
 
-**GitLab API langsung (live)** — selalu mutakhir, plus +/- baris asli.
-Generate token di `https://git.bluebird.id/-/user_settings/personal_access_tokens`
-(scope `read_api`), lalu `export GITLAB_TOKEN=glpat-...`:
+**GitLab API directly (live)** — always up to date, plus real +/- lines.
+Generate a token at `https://git.bluebird.id/-/user_settings/personal_access_tokens`
+(scope `read_api`), then `export GITLAB_TOKEN=glpat-...`:
 
 ```yaml
 gitlab:
   url: "https://git.bluebird.id"
-  projects: [692, "da/driverapp-gateway"]   # opsional seed; id atau path
-  aliases: {"orang@gmail.com": "orang@bluebirdgroup.com"}  # commit email pribadi
+  projects: [692, "da/driverapp-gateway"]   # optional seed; id or path
+  aliases: {"orang@gmail.com": "orang@bluebirdgroup.com"}  # personal commit email
 ```
 
-Secara default tool **auto-discover** repo tiap engineer (lewat push events GitLab),
-digabung dengan `projects` seed — jadi repo yang tidak terdaftar (mis. `argocd/*`)
-ikut tertangkap. Matikan dengan `--no-discover` kalau ingin pakai `projects` saja.
+By default the tool **auto-discovers** each engineer's repos (via GitLab push events),
+merged with the `projects` seed — so repos that aren't registered (e.g. `argocd/*`)
+get picked up too. Disable with `--no-discover` if you want to use only `projects`.
 
-Flag `--exclude-noise` menghitung ulang +/- baris **tanpa file noise** (vendor, lockfile,
-generated, dll — lihat `DEFAULT_NOISE_PATTERNS`; tambah lewat `gitlab.noise_patterns`).
-Ini mengambil diff tiap commit (1 call/commit) sehingga **lebih lambat**, jadi opsional.
+The `--exclude-noise` flag recomputes +/- lines **excluding noise files** (vendor, lockfiles,
+generated, etc — see `DEFAULT_NOISE_PATTERNS`; add more via `gitlab.noise_patterns`).
+This fetches the diff of each commit (1 call/commit), making it **slower**, so it's optional.
 
-Tool menambah section **Aktivitas Commit** + **Matriks Task vs Commit**, join lewat id ClickUp.
+The tool adds a **Commit Activity** section + **Task vs Commit Matrix**, joined via ClickUp id.
 
-Lihat id/email member workspace:
+View the id/email of workspace members:
 
 ```bash
 python -m engineering_productivity --list-members
 python -m engineering_productivity --list-teams
 ```
 
-## Pemakaian
+## Usage
 
 ```bash
-# 30 hari terakhir, laporan ringkas (cepat)
+# last 30 days, concise report (fast)
 python -m engineering_productivity --days 30 -o reports/bulan-ini.md
 
-# Rentang spesifik + analisis mendalam (cycle time & bottleneck)
+# specific range + deep analysis (cycle time & bottleneck)
 python -m engineering_productivity --since 2026-05-01 --until 2026-05-31 --deep -o reports/mei.md
 ```
 
-| Flag | Default | Fungsi |
+| Flag | Default | Function |
 |---|---|---|
-| `--config` | `config.yaml` | Path konfigurasi |
-| `--since` / `--until` | — / hari ini | Rentang tanggal `YYYY-MM-DD` |
-| `--days` | `30` | Lookback bila `--since` kosong |
-| `--deep` | off | Ambil `time_in_status` per task → cycle time & bottleneck |
-| `--last-done` | off | Tambah kolom *Selesai terakhir* (kapan tiap engineer terakhir menutup task, lintas periode) |
-| `--utilization` | off | Section *Engineer Underutilized* (skor relatif tim; tarik WIP & story point) |
-| `-o`, `--output` | `reports/report.md` | File output |
+| `--config` | `config.yaml` | Configuration path |
+| `--since` / `--until` | — / today | Date range `YYYY-MM-DD` |
+| `--days` | `30` | Lookback when `--since` is empty |
+| `--deep` | off | Fetch `time_in_status` per task → cycle time & bottleneck |
+| `--last-done` | off | Add a *Last completed* column (when each engineer last closed a task, across the period) |
+| `--utilization` | off | *Underutilized Engineers* section (team-relative score; pulls WIP & story points) |
+| `-o`, `--output` | `reports/report.md` | Output file |
 
-> **Utilisasi:** skor 0–100 = rata-rata percentile lintas sinyal (makin rendah makin underutilized).
-> Story point dibaca dari field native ClickUp `points` (sprint points); sinyal yang datanya kosong
-> otomatis di-skip. Ini pemicu obrolan kapasitas, **bukan** ranking kinerja.
+> **Utilization:** score 0–100 = average percentile across signals (lower means more underutilized).
+> Story points are read from ClickUp's native `points` field (sprint points); signals with no data
+> are skipped automatically. This is a prompt for a capacity conversation, **not** a performance ranking.
 
-## Dashboard interaktif
+## Interactive dashboard
 
-Selain laporan Markdown, ada dashboard Streamlit untuk eksplorasi:
+In addition to the Markdown report, there's a Streamlit dashboard for exploration:
 
 ```bash
 pip install -r requirements.txt
-export CLICKUP_TOKEN=pk_...        # dan GITLAB_TOKEN=glpat-... bila pakai sumber GitLab
+export CLICKUP_TOKEN=pk_...        # and GITLAB_TOKEN=glpat-... if using the GitLab source
 streamlit run dashboard.py
 ```
 
-Fitur: filter periode & engineer, toggle `deep`/filter task basi/filter noise,
-KPI ringkas, chart throughput & hari-aktif, **matriks Task vs Commit** interaktif (Plotly),
-tabel bottleneck, dan tombol unduh laporan Markdown. Tombol **Refresh data** mengosongkan cache.
-Dashboard memakai pipeline yang sama dengan CLI (`engineering_productivity.pipeline.gather_report`).
+Features: filter by period & engineer, toggle `deep`/stale-task filter/noise filter,
+concise KPIs, throughput & active-days charts, an interactive **Task vs Commit matrix** (Plotly),
+bottleneck table, and a button to download the Markdown report. The **Refresh data** button clears the cache.
+The dashboard uses the same pipeline as the CLI (`engineering_productivity.pipeline.gather_report`).
 
-> Jalankan hanya di localhost — berisi data produktivitas karyawan. `deep` & filter noise
-> membuat tiap interaksi lebih lambat (default keduanya OFF; hasil di-cache).
+> Run only on localhost — it contains employee productivity data. `deep` & the noise filter
+> make each interaction slower (both default to OFF; results are cached).
 
-## Cache Postgres (opsional, biar load cepat)
+## Postgres cache (optional, for faster loads)
 
-Tanpa cache, tiap run/load menarik ulang semua dari ClickUp & GitLab — paling mahal di query **task**
-(filter custom field Developer ~10 detik/halaman, query open tanpa batas tanggal ~333 detik), mode `--deep`
-(1 call/task), dan commit GitLab (ratusan call). Aktifkan cache Postgres agar data disimpan & dipakai ulang;
-tiap load hanya menarik **delta**:
+Without a cache, every run/load re-pulls everything from ClickUp & GitLab — most expensive for **task** queries
+(filter by Developer custom field ~10s/page, open-ended query ~333s), `--deep` mode (1 call/task), and GitLab
+commits (hundreds of calls). Enable the Postgres cache so data is stored and reused; each load only pulls the **delta**:
 
-- **Task ClickUp** (selesai, open, last-done): disinkron incremental via `date_updated`. Engineer baru
-  di-backfill sekali sejak `task_backfill_since` (default `2026-05-01`); load berikutnya hanya tarik task
-  yang berubah → cepat. Atribusi tetap via kolom Developer.
-- **time_in_status** task *done* (immutable) & **commit** per sha.
+- **ClickUp tasks** (done, open, last-done): synced incrementally via `date_updated`. New engineers are
+  backfilled once from `task_backfill_since` (default `2026-05-01`); subsequent loads only fetch changed tasks → fast.
+  Attribution still via the Developer column.
+- **time_in_status** of *done* tasks (immutable) & **commits** per sha.
 
 ```bash
-createdb engineering_productivity          # database terpisah di Postgres-mu
+createdb engineering_productivity          # a separate database in your Postgres
 export EP_STORE_DSN=postgres://localhost:5432/engineering_productivity
 ```
 
-Atau isi `store.dsn` di `config.yaml` (dan opsional `task_backfill_since`). Otomatis aktif bila DSN ada;
-tanpa DSN = mode live (perilaku lama, jalur fallback). Run/dashboard kedua untuk parameter sama jadi jauh
-lebih cepat (task & deep dari cache, commit cuma yang baru). Catatan: `--exclude-noise` belum di-cache (live).
+Or set `store.dsn` in `config.yaml` (and optionally `task_backfill_since`). Enabled automatically when a DSN exists;
+without a DSN = live mode (old behavior, fallback path). A second run/dashboard for the same parameters becomes much
+faster (tasks & deep from cache, only new commits pulled). Note: `--exclude-noise` is not yet cached (stays live).
 
-## Catatan akurasi
+## Accuracy notes
 
-- **Atribusi via kolom Developer:** "siapa yang mengerjakan task" diambil dari custom field
-  **Developer** (tipe users), bukan dari `assignees`. Task dengan Developer kosong dilewati.
-  Field di-resolve otomatis by name (`developer_field_name`, default `Developer`); bisa
-  dioverride dengan `developer_field_id`.
-- **Shared credit:** task dengan banyak Developer dihitung untuk tiap engineer di kolom itu.
-- **Time tracked** diambil dari endpoint *time entries* lalu dikreditkan ke **Developer** pada
-  task time entry tersebut (bukan si pencatat), bukan dari field `time_spent` task. Catatan:
-  hanya time entry pada task yang ikut ter-fetch yang terhitung.
-- Mode `--deep` melakukan 1 panggilan API per task → lebih lambat & lebih boros kuota
-  (rate limit ClickUp ~100 req/menit, sudah ditangani otomatis dengan retry).
-- Metrik ini alat bantu diskusi, **bukan** penilaian kinerja absolut. Throughput tinggi
-  belum tentu = produktif; selalu baca bareng konteks (kompleksitas task, dsb).
+- **Attribution via the Developer column:** "who worked on the task" is taken from the custom field
+  **Developer** (users type), not from `assignees`. Tasks with an empty Developer are skipped.
+  The field is resolved automatically by name (`developer_field_name`, default `Developer`); it can be
+  overridden with `developer_field_id`.
+- **Shared credit:** a task with multiple Developers is counted for each engineer in that column.
+- **Time tracked** is taken from the *time entries* endpoint and credited to the **Developer** on
+  the task of that time entry (not the person who logged it), not from the task's `time_spent` field. Note:
+  only time entries on tasks that were fetched are counted.
+- `--deep` mode makes 1 API call per task → slower & more quota-hungry
+  (ClickUp rate limit ~100 req/min, already handled automatically with retry).
+- These metrics are a discussion aid, **not** an absolute performance assessment. High throughput
+  doesn't necessarily mean productive; always read it alongside context (task complexity, etc).
 
-## Struktur
+## Structure
 
 ```
 engineering_productivity/
-  config.py     # muat & validasi config.yaml (+ token dari env)
-  client.py     # klien ClickUp REST API v2 (paginasi + retry rate limit)
-  gitlab.py     # sumber commit live dari GitLab API (+ auto-discover, filter noise)
-  metrics.py    # perhitungan throughput, lead/cycle time, time tracked, status flow
-  pipeline.py   # orkestrasi reusable (dipakai CLI & dashboard)
+  config.py     # load & validate config.yaml (+ token from env)
+  client.py     # ClickUp REST API v2 client (pagination + rate-limit retry)
+  gitlab.py     # live commit source from the GitLab API (+ auto-discover, noise filter)
+  metrics.py    # compute throughput, lead/cycle time, time tracked, status flow
+  pipeline.py   # reusable orchestration (used by CLI & dashboard)
   report.py     # render Markdown
   __main__.py   # CLI
-dashboard.py    # dashboard Streamlit (streamlit run dashboard.py)
+dashboard.py    # Streamlit dashboard (streamlit run dashboard.py)
 ```
 
-## Lisensi
+## License
 
 [MIT](LICENSE) © Zihar Mehta
