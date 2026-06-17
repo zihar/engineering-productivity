@@ -27,8 +27,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--deep", action="store_true", help="Ambil time_in_status per task (cycle time & bottleneck; lebih banyak API call)")
     p.add_argument("--max-age", type=int, default=None, metavar="HARI", help="Abaikan task basi: lead time (dibuat->selesai) lebih dari N hari")
     p.add_argument("--no-commits", action="store_true", help="Lewati aktivitas commit sepenuhnya")
-    p.add_argument("--commits-source", choices=["auto", "gitlab", "db", "none"], default="auto",
-                   help="Sumber commit: gitlab (live API), db (scorecard, bisa basi), auto (gitlab > db), none")
+    p.add_argument("--commits-source", choices=["auto", "gitlab", "none"], default="auto",
+                   help="Sumber commit: gitlab (live API), auto (gitlab bila terkonfigurasi), none")
     p.add_argument("--no-discover", action="store_true",
                    help="(GitLab) jangan auto-discover repo per engineer; pakai daftar gitlab.projects saja")
     p.add_argument("--exclude-noise", action="store_true",

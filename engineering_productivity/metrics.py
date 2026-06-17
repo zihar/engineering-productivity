@@ -74,7 +74,7 @@ class EngineerStats:
     estimate_ms: int = 0
     tracked_ms: int = 0
     per_week: dict[str, int] = field(default_factory=lambda: defaultdict(int))
-    # Aktivitas commit GitLab (dari DB squad-scorecard, join via id ClickUp).
+    # Aktivitas commit GitLab (join via id ClickUp).
     commits: int = 0
     commit_additions: int = 0
     commit_deletions: int = 0
@@ -159,8 +159,6 @@ class ReportData:
     max_age_days: int | None = None
     filtered_stale: int = 0
     has_commit_data: bool = False
-    commit_through: str | None = None
-    commit_synced_at: str | None = None
     commit_source: str | None = None
     commit_noise_filtered: bool = False
     has_last_done: bool = False
@@ -182,8 +180,6 @@ def build_report_data(
     tz_offset: float,
     max_age_days: int | None = None,
     commit_stats: dict | None = None,
-    commit_through: str | None = None,
-    commit_synced_at: str | None = None,
     commit_source: str | None = None,
     commit_noise_filtered: bool = False,
     last_done_ms: dict[int, int] | None = None,
@@ -312,8 +308,6 @@ def build_report_data(
         max_age_days=max_age_days,
         filtered_stale=filtered_stale,
         has_commit_data=commit_stats is not None,
-        commit_through=commit_through,
-        commit_synced_at=commit_synced_at,
         commit_source=commit_source,
         commit_noise_filtered=commit_noise_filtered,
         has_last_done=last_done_ms is not None,

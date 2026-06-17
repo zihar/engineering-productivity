@@ -1,7 +1,7 @@
 """Pipeline pengambilan data yang reusable (dipakai CLI maupun dashboard).
 
 Mengorkestrasi: resolve engineer -> tarik task ClickUp -> time_in_status (deep) ->
-time entries -> aktivitas commit (GitLab live / DB scorecard) -> build_report_data.
+time entries -> aktivitas commit (GitLab live) -> build_report_data.
 Semua progres dilaporkan lewat callback `progress` agar bebas dari I/O (CLI cetak
 ke stderr, Streamlit tampilkan di spinner/status).
 """
@@ -14,8 +14,6 @@ from typing import Callable
 
 from .client import ClickUpClient, ClickUpError
 from .config import Config
-from .db import DBError, fetch_commit_freshness
-from .db import fetch_commit_stats as db_fetch_commit_stats
 from .gitlab import GitLabClient, GitLabError, discover_project_ids
 from .gitlab import fetch_commit_stats as gl_fetch_commit_stats
 from .metrics import ReportData, build_report_data
@@ -37,7 +35,7 @@ class GatherOptions:
     tz: float = 7.0
     deep: bool = False
     max_age: int | None = None
-    commits_source: str = "auto"  # auto | gitlab | db | none
+    commits_source: str = "auto"  # auto | gitlab | none
     no_discover: bool = False
     exclude_noise: bool = False
     no_commits: bool = False
@@ -79,18 +77,14 @@ def resolve_targets(config: Config, members: list[dict], progress: Progress = _n
 
 
 def resolve_commit_source(choice: str, config: Config) -> str:
-    """Tentukan sumber commit efektif. 'auto' utamakan GitLab (live) lalu DB."""
+    """Tentukan sumber commit efektif. 'auto' utamakan GitLab (live)."""
     if choice == "gitlab":
         return "gitlab" if config.gitlab else "none"
-    if choice == "db":
-        return "db" if config.db_dsn else "none"
     if choice == "none":
         return "none"
     # auto
     if config.gitlab:
         return "gitlab"
-    if config.db_dsn:
-        return "db"
     return "none"
 
 
@@ -183,7 +177,7 @@ def gather_report(
         time_entries = []
 
     commit_stats = None
-    commit_through = commit_synced_at = commit_source = None
+    commit_source = None
     source = "none" if opts.no_commits else resolve_commit_source(opts.commits_source, config)
 
     if source == "gitlab":
@@ -226,20 +220,6 @@ def gather_report(
                 )
         except GitLabError as exc:
             progress(f"    [!] Commit GitLab dilewati: {exc}")
-            commit_stats = None
-    elif source == "db":
-        commit_source = "DB squad-scorecard"
-        progress("[*] Menarik aktivitas commit dari DB squad-scorecard ...")
-        try:
-            commit_stats = db_fetch_commit_stats(config.db_dsn, sorted(target_ids), since_str, until_str)
-            commit_through, commit_synced_at = fetch_commit_freshness(config.db_dsn)
-            if commit_through and commit_through < until_str:
-                progress(
-                    f"    [!] Commit hanya tersinkron s/d {commit_through} "
-                    f"(periode s/d {until_str}) — data ETL belum mutakhir."
-                )
-        except DBError as exc:
-            progress(f"    [!] Commit dilewati (DB tak terjangkau): {exc}")
             commit_stats = None
 
     last_done_ms: dict[int, int] | None = None
@@ -293,8 +273,6 @@ def gather_report(
         tz_offset=opts.tz,
         max_age_days=opts.max_age,
         commit_stats=commit_stats,
-        commit_through=commit_through,
-        commit_synced_at=commit_synced_at,
         commit_source=commit_source,
         commit_noise_filtered=bool(commit_stats is not None and source == "gitlab" and opts.exclude_noise),
         last_done_ms=last_done_ms,

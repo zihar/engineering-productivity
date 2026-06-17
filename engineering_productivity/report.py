@@ -26,14 +26,6 @@ def render_markdown(data: ReportData, *, generated_at: str) -> str:
             f"- **Filter task basi:** {data.filtered_stale} task dengan lead time "
             f"> {data.max_age_days} hari diabaikan"
         )
-    if data.has_commit_data and data.commit_through:
-        note = f"- **Commit GitLab tersinkron s/d:** {data.commit_through}"
-        if data.commit_through < data.until:
-            note += (
-                f" ⚠️ **lebih lama dari periode** (s/d {data.until}); commit setelah "
-                f"{data.commit_through} belum masuk DB — jalankan ulang ETL squad-scorecard"
-            )
-        lines.append(note)
     if data.has_last_done:
         lines.append(
             f"- **Kolom 'Selesai terakhir':** tanggal task terakhir berstatus done per engineer "

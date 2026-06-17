@@ -1,7 +1,7 @@
 """Sumber data commit langsung dari GitLab REST API v4.
 
-Alternatif live untuk DB squad-scorecard: tarik commit per project pada rentang
-waktu, lalu atribusikan ke engineer lewat email penulis commit (+ alias).
+Tarik commit per project dari GitLab API pada rentang waktu, lalu atribusikan
+ke engineer lewat email penulis commit (+ alias).
 Selalu mutakhir dan bisa membawa additions/deletions asli.
 Dok API: https://docs.gitlab.com/ee/api/commits.html
 """
@@ -169,7 +169,7 @@ def discover_project_ids(
     *,
     on_warn=None,
 ) -> set[str]:
-    """Temukan repo yang di-push tiap engineer pada periode (independen dari scorecard).
+    """Temukan repo yang di-push tiap engineer pada periode.
 
     engineers = daftar (email, nama). Mengembalikan himpunan project id (string).
     """

@@ -17,7 +17,7 @@ menghasilkan **laporan Markdown** siap di-share ke management.
 | **Cycle time** | Waktu task berada di status aktif (mis. In Progress, Review). Butuh `--deep`. |
 | **Time tracked** | Jam time-tracking nyata per engineer vs estimasi, plus akurasi estimasi. |
 | **Status flow / bottleneck** | Median/p90 lama task nyangkut di tiap status (status terminal dikecualikan). Butuh `--deep`. |
-| **Aktivitas commit (GitLab)** | Commit, hari aktif, +/- baris, & repo per engineer. Sumber: GitLab API langsung (live) atau DB squad-scorecard. Opsional. |
+| **Aktivitas commit (GitLab)** | Commit, hari aktif, +/- baris, & repo per engineer. Sumber: GitLab API langsung (live). Opsional. |
 | **Matriks task vs commit** | Kuadran 2×2 (throughput ClickUp × hari aktif commit) untuk lihat pola disiplin task vs output kode. |
 | **Utilisasi (underutilized)** | Skor 0–100 relatif tim dari 4 sinyal (WIP, hari aktif commit, throughput, story point) untuk menandai engineer berkapasitas nganggur. Opsional. |
 
@@ -51,9 +51,9 @@ engineers:
 
 ### (Opsional) Aktivitas commit GitLab
 
-Dua sumber, pilih dengan `--commits-source {auto,gitlab,db,none}` (default `auto`: GitLab dulu, fallback DB):
+Pilih dengan `--commits-source {auto,gitlab,none}` (default `auto`: GitLab bila terkonfigurasi):
 
-**A. GitLab API langsung (live, disarankan)** — selalu mutakhir, plus +/- baris asli.
+**GitLab API langsung (live)** — selalu mutakhir, plus +/- baris asli.
 Generate token di `https://git.bluebird.id/-/user_settings/personal_access_tokens`
 (scope `read_api`), lalu `export GITLAB_TOKEN=glpat-...`:
 
@@ -72,15 +72,7 @@ Flag `--exclude-noise` menghitung ulang +/- baris **tanpa file noise** (vendor, 
 generated, dll — lihat `DEFAULT_NOISE_PATTERNS`; tambah lewat `gitlab.noise_patterns`).
 Ini mengambil diff tiap commit (1 call/commit) sehingga **lebih lambat**, jadi opsional.
 
-**B. DB squad-scorecard** — cepat tapi bergantung kesegaran ETL. Isi `db.dsn` atau env `SCORECARD_DSN`:
-
-```yaml
-db:
-  dsn: "postgres://user:pass@localhost:5432/scorecard?sslmode=disable"
-```
-
 Tool menambah section **Aktivitas Commit** + **Matriks Task vs Commit**, join lewat id ClickUp.
-Kalau pakai DB dan datanya lebih lama dari periode, laporan memperingatkan otomatis.
 Matikan fitur commit dengan `--no-commits`.
 
 Lihat id/email member workspace:
@@ -164,7 +156,6 @@ Catatan: mode `--exclude-noise` belum di-cache (tetap live).
 engineering_productivity/
   config.py     # muat & validasi config.yaml (+ token dari env)
   client.py     # klien ClickUp REST API v2 (paginasi + retry rate limit)
-  db.py         # sumber commit dari DB squad-scorecard
   gitlab.py     # sumber commit live dari GitLab API (+ auto-discover, filter noise)
   metrics.py    # perhitungan throughput, lead/cycle time, time tracked, status flow
   pipeline.py   # orkestrasi reusable (dipakai CLI & dashboard)
