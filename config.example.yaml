@@ -9,9 +9,7 @@ token: ""
 # yang bisa diakses token-mu (jalankan dengan --list-teams untuk melihat daftarnya).
 team_id: ""
 
-# (Opsional) Sumber aktivitas commit — pilih salah satu (atau dua-duanya).
-#
-# A) GitLab API langsung — LIVE & tidak bergantung DB. Disarankan.
+# (Opsional) Sumber aktivitas commit — GitLab API langsung (LIVE). Disarankan.
 #    Token: https://git.bluebird.id/-/user_settings/personal_access_tokens (scope read_api)
 #    atau env GITLAB_TOKEN. projects = daftar id/path repo yang dianalisis.
 gitlab:
@@ -21,12 +19,7 @@ gitlab:
   aliases: {}           # mis. {"orang@gmail.com": "orang@bluebirdgroup.com"}
   noise_patterns: []    # tambahan pola file noise (di luar default vendor/lock/generated)
 #
-# B) DB squad-scorecard (tabel engineer_commit_days) — cepat tapi bisa basi.
-#    Bisa juga lewat env SCORECARD_DSN.
-db:
-  dsn: ""  # contoh: postgres://user:pass@localhost:5432/scorecard?sslmode=disable
-#
-# Pilih sumber saat run dengan --commits-source {auto,gitlab,db,none} (default auto: gitlab > db).
+# Pilih sumber saat run dengan --commits-source {auto,gitlab,none} (default auto: gitlab bila terkonfigurasi).
 
 # (Opsional) Cache Postgres: simpan time_in_status (deep) & commit agar load berikutnya cepat
 # (incremental — hanya delta yang ditarik; data done/immutable tak diulang). Bisa via env EP_STORE_DSN.

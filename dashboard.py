@@ -211,11 +211,6 @@ c4.metric("Periode", f"{data.since} → {data.until}")
 
 if data.has_commit_data:
     st.caption(f"Sumber commit: {data.commit_source}")
-    if data.commit_through and data.commit_through < data.until:
-        st.warning(
-            f"⚠️ Data commit hanya tersinkron s/d **{data.commit_through}** "
-            f"(periode s/d {data.until}). Angka commit terbaru belum lengkap."
-        )
 if data.max_age_days is not None and data.filtered_stale:
     st.caption(f"🧹 {data.filtered_stale} task basi (lead time > {data.max_age_days} hari) diabaikan.")
 

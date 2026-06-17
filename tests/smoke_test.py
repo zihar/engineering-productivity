@@ -9,7 +9,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from engineering_productivity.db import CommitStats
+from engineering_productivity.models import CommitStats
 from engineering_productivity.gitlab import (
     DEFAULT_NOISE_PATTERNS,
     clean_diff_stats,
@@ -115,7 +115,6 @@ data = build_report_data(
     until="2024-05-31",
     tz_offset=7,
     commit_stats=commit_stats,
-    commit_through="2024-05-15",  # < until 2024-05-31 -> harus memicu peringatan basi
 )
 
 # --- Asersi inti ---
@@ -249,7 +248,6 @@ _ids, _names = resolve_targets(_cfg, _members)
 assert _ids == {101, 202}, _ids                       # Budi via email, Sari via id
 assert _names[101] == "Budi" and _names[202] == "Sari"
 assert resolve_commit_source("auto", _cfg) == "gitlab"  # gitlab terkonfigurasi -> diutamakan
-assert resolve_commit_source("db", _cfg) == "none"      # db_dsn kosong
 assert resolve_commit_source("none", _cfg) == "none"
 assert GatherOptions().days == 30 and GatherOptions().commits_source == "auto"
 
@@ -400,7 +398,6 @@ assert "Budi" in md and "Sari" in md
 assert "Bottleneck" in md
 assert "Aktivitas Commit" in md
 assert "Matriks Task vs Commit" in md
-assert "lebih lama dari periode" in md  # peringatan commit basi (through < until)
 
 out = Path(__file__).resolve().parent / "sample_report.md"
 out.write_text(md, encoding="utf-8")

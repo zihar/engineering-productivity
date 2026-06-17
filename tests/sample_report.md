@@ -4,7 +4,6 @@
 - **Engineer dianalisis:** 2
 - **Total task selesai:** 4
 - **Zona waktu bucket:** UTC+7
-- **Commit GitLab tersinkron s/d:** 2024-05-15 ⚠️ **lebih lama dari periode** (s/d 2024-05-31); commit setelah 2024-05-15 belum masuk DB — jalankan ulang ETL squad-scorecard
 - **Dibuat:** 2024-05-31 09:00 WIB
 
 > Catatan: task dengan banyak assignee dihitung untuk tiap engineer yang ditugaskan (shared credit). Cycle time hanya tersedia pada mode `--deep`.

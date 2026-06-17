@@ -1,4 +1,4 @@
-"""Tipe data bersama antar-sumber (DB scorecard maupun GitLab API langsung)."""
+"""Tipe data bersama untuk statistik commit (dari GitLab API)."""
 
 from __future__ import annotations
 
