@@ -125,18 +125,24 @@ Dashboard memakai pipeline yang sama dengan CLI (`engineering_productivity.pipel
 
 ## Cache Postgres (opsional, biar load cepat)
 
-Tanpa cache, tiap run/load menarik ulang semua dari ClickUp & GitLab — paling mahal di mode `--deep`
-(1 call/task) dan commit GitLab (ratusan call). Aktifkan cache Postgres agar data **immutable**
-(time_in_status task *done* & commit per sha) disimpan dan dipakai ulang; tiap load hanya menarik **delta**.
+Tanpa cache, tiap run/load menarik ulang semua dari ClickUp & GitLab — paling mahal di query **task**
+(filter custom field Developer ~10 detik/halaman, query open tanpa batas tanggal ~333 detik), mode `--deep`
+(1 call/task), dan commit GitLab (ratusan call). Aktifkan cache Postgres agar data disimpan & dipakai ulang;
+tiap load hanya menarik **delta**:
+
+- **Task ClickUp** (selesai, open, last-done): disinkron incremental via `date_updated`. Engineer baru
+  di-backfill sekali sejak `task_backfill_since` (default `2026-05-01`); load berikutnya hanya tarik task
+  yang berubah → cepat. Atribusi tetap via kolom Developer.
+- **time_in_status** task *done* (immutable) & **commit** per sha.
 
 ```bash
 createdb engineering_productivity          # database terpisah di Postgres-mu
 export EP_STORE_DSN=postgres://localhost:5432/engineering_productivity
 ```
 
-Atau isi `store.dsn` di `config.yaml`. Otomatis aktif bila DSN ada; tanpa DSN = mode live (perilaku lama).
-Run/dashboard kedua untuk parameter sama jadi jauh lebih cepat (deep dari cache, commit cuma yang baru).
-Catatan: mode `--exclude-noise` belum di-cache (tetap live).
+Atau isi `store.dsn` di `config.yaml` (dan opsional `task_backfill_since`). Otomatis aktif bila DSN ada;
+tanpa DSN = mode live (perilaku lama, jalur fallback). Run/dashboard kedua untuk parameter sama jadi jauh
+lebih cepat (task & deep dari cache, commit cuma yang baru). Catatan: `--exclude-noise` belum di-cache (live).
 
 ## Catatan akurasi
 

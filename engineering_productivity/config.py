@@ -36,6 +36,7 @@ class Config:
     store_dsn: str | None = None  # Postgres cache (time_in_status + commit); opsional
     developer_field_id: str | None = None  # override; bila None di-resolve by name
     developer_field_name: str = "Developer"  # nama custom field untuk auto-discover
+    task_backfill_since: str = "2026-05-01"  # backfill awal cache task (engineer baru)
     extra: dict = field(default_factory=dict)
 
     @property
@@ -100,6 +101,7 @@ def load_config(path: str | Path) -> Config:
         store_dsn=store_dsn,
         developer_field_id=raw.get("developer_field_id") or None,
         developer_field_name=raw.get("developer_field_name") or "Developer",
+        task_backfill_since=raw.get("task_backfill_since") or "2026-05-01",
     )
 
 

@@ -16,7 +16,13 @@ from .client import ClickUpClient, ClickUpError
 from .config import Config
 from .gitlab import GitLabClient, GitLabError, discover_project_ids
 from .gitlab import fetch_commit_stats as gl_fetch_commit_stats
-from .metrics import ReportData, build_report_data, task_developer_ids
+from .metrics import (
+    TERMINAL_STATUS_TYPES,
+    ReportData,
+    build_report_data,
+    task_developer_ids,
+    to_int_ms,
+)
 from .models import CommitStats
 from .store import Store, StoreError
 
@@ -162,16 +168,33 @@ def gather_report(
     date_done_gt = parse_date(since_str, opts.tz)
     date_done_lt = parse_date(until_str, opts.tz, end_of_day=True)
 
-    progress(f"[*] Menarik task {len(target_ids)} engineer, {since_str} s/d {until_str} ...")
-    tasks = list(
-        client.iter_team_tasks(
-            team_id,
-            developer_field_id=dev_field_id,
-            developer_ids=sorted(target_ids),
-            date_done_gt=date_done_gt,
-            date_done_lt=date_done_lt,
+    # Sumber task: bila store aktif, sinkron incremental ke cache lalu derive dari cache
+    # (menghilangkan 3 query Developer yang lambat). Tanpa store → jalur live (fallback).
+    stored_tasks: list[dict] | None = None
+    if store is not None:
+        backfill_since_ms = parse_date(config.task_backfill_since, opts.tz)
+        _sync_tasks(client, store, team_id, dev_field_id, target_ids, backfill_since_ms, progress)
+        stored_tasks = store.get_tasks(sorted(target_ids))
+        progress(f"[*] {len(stored_tasks)} task dari cache (semua status).")
+
+    if stored_tasks is not None:
+        # Task selesai-di-window: date_done dalam [date_done_gt, date_done_lt].
+        tasks = [
+            t for t in stored_tasks
+            if (dd := (to_int_ms(t.get("date_done")) or to_int_ms(t.get("date_closed")))) is not None
+            and date_done_gt <= dd <= date_done_lt
+        ]
+    else:
+        progress(f"[*] Menarik task {len(target_ids)} engineer, {since_str} s/d {until_str} ...")
+        tasks = list(
+            client.iter_team_tasks(
+                team_id,
+                developer_field_id=dev_field_id,
+                developer_ids=sorted(target_ids),
+                date_done_gt=date_done_gt,
+                date_done_lt=date_done_lt,
+            )
         )
-    )
     progress(f"[*] {len(tasks)} task selesai ditemukan.")
 
     time_in_status = _fetch_time_in_status(client, tasks, store, progress) if opts.deep else None
@@ -241,19 +264,22 @@ def gather_report(
         lookback_lo = (
             datetime.strptime(until_str, "%Y-%m-%d") - timedelta(days=opts.last_done_lookback)
         ).strftime("%Y-%m-%d")
+        lookback_lo_ms = parse_date(lookback_lo, opts.tz)
         progress(f"[*] Mencari tanggal task terakhir selesai (lookback {opts.last_done_lookback} hari) ...")
         last_done_ms = {}
-        for t in client.iter_team_tasks(
-            team_id,
-            developer_field_id=dev_field_id,
-            developer_ids=sorted(target_ids),
-            date_done_gt=parse_date(lookback_lo, opts.tz),
-            date_done_lt=date_done_lt,
-        ):
-            raw = t.get("date_done") or t.get("date_closed")
-            try:
-                dd = int(raw)
-            except (TypeError, ValueError):
+        if stored_tasks is not None:
+            ld_source = stored_tasks
+        else:
+            ld_source = client.iter_team_tasks(
+                team_id,
+                developer_field_id=dev_field_id,
+                developer_ids=sorted(target_ids),
+                date_done_gt=lookback_lo_ms,
+                date_done_lt=date_done_lt,
+            )
+        for t in ld_source:
+            dd = to_int_ms(t.get("date_done")) or to_int_ms(t.get("date_closed"))
+            if dd is None or dd < lookback_lo_ms or dd > date_done_lt:
                 continue
             for aid in task_developer_ids(t, dev_field_id):
                 if aid in target_ids and dd > last_done_ms.get(aid, 0):
@@ -262,14 +288,21 @@ def gather_report(
     open_tasks_count: dict[int, int] | None = None
     open_story_points: dict[int, float] | None = None
     if opts.utilization:
-        progress("[*] Menarik task open (WIP & story point) ...")
+        progress("[*] Menghitung task open (WIP & story point) ...")
         open_tasks_count, open_story_points = {}, {}
-        for t in client.iter_team_tasks(
-            team_id,
-            developer_field_id=dev_field_id,
-            developer_ids=sorted(target_ids),
-            include_closed=False,
-        ):
+        if stored_tasks is not None:
+            open_source = (
+                t for t in stored_tasks
+                if ((t.get("status") or {}).get("type") or "").lower() not in TERMINAL_STATUS_TYPES
+            )
+        else:
+            open_source = client.iter_team_tasks(
+                team_id,
+                developer_field_id=dev_field_id,
+                developer_ids=sorted(target_ids),
+                include_closed=False,
+            )
+        for t in open_source:
             raw = t.get("points")
             try:
                 pts = float(raw) if raw not in (None, "") else 0.0
@@ -330,6 +363,65 @@ def _fetch_time_in_status(client, tasks: list[dict], store, progress: Progress) 
             progress(f"    ... {n_new} ditarik baru")
     progress(f"    deep: {n_cache} dari cache, {n_new} ditarik baru.")
     return out
+
+
+def _task_to_row(task: dict, dev_field_id: str) -> dict:
+    """Ekstrak kolom yang di-index untuk satu task; payload = task dict utuh."""
+    return {
+        "task_id": task["id"],
+        "payload": task,
+        "date_updated": to_int_ms(task.get("date_updated")),
+        "developer_ids": task_developer_ids(task, dev_field_id),
+        "date_done": to_int_ms(task.get("date_done")) or to_int_ms(task.get("date_closed")),
+        "status_type": ((task.get("status") or {}).get("type") or "").lower(),
+    }
+
+
+def _sync_tasks(client, store, team_id, dev_field_id, target_ids, backfill_since_ms, progress) -> None:
+    """Sinkronkan cache task ke store: backfill engineer baru sekali, lalu incremental via watermark."""
+    target_sorted = sorted(target_ids)
+
+    # 1. Backfill engineer baru (belum pernah di-cover oleh query Developer yang lambat).
+    backfilled = store.get_backfilled_engineers()
+    new = [i for i in target_sorted if i not in backfilled]
+    if new:
+        progress(f"[*] Backfill cache task {len(new)} engineer baru (sekali, agak lambat) ...")
+        rows = [
+            _task_to_row(t, dev_field_id)
+            for t in client.iter_team_tasks(
+                team_id,
+                developer_field_id=dev_field_id,
+                developer_ids=new,
+                date_updated_gt=backfill_since_ms,
+                include_closed=True,
+            )
+        ]
+        store.upsert_tasks(rows)
+        store.mark_backfilled(new)
+        progress(f"    backfill: {len(rows)} task tersimpan.")
+
+    # 2. Incremental: tarik hanya task yang berubah sejak watermark.
+    wm = store.get_task_watermark() or backfill_since_ms
+    progress("[*] Sinkron incremental task (delta sejak terakhir) ...")
+    max_seen = wm
+    n = 0
+    rows = []
+    for t in client.iter_team_tasks(
+        team_id,
+        developer_field_id=dev_field_id,
+        developer_ids=target_sorted,
+        date_updated_gt=wm,
+        include_closed=True,
+    ):
+        row = _task_to_row(t, dev_field_id)
+        rows.append(row)
+        n += 1
+        if row["date_updated"] and row["date_updated"] > max_seen:
+            max_seen = row["date_updated"]
+    store.upsert_tasks(rows)
+    store.set_task_watermark(max_seen)
+    store.commit()
+    progress(f"    incremental: {n} task delta tersimpan.")
 
 
 def _coverage_gaps(cov: tuple[str, str] | None, since: str, until: str) -> list[tuple[str, str]]:

@@ -27,11 +27,16 @@ gitlab:
 #
 # Commit selalu dari GitLab (bila terkonfigurasi di atas); tanpa GitLab, metrik commit dilewati.
 
-# (Opsional) Cache Postgres: simpan time_in_status (deep) & commit agar load berikutnya cepat
-# (incremental — hanya delta yang ditarik; data done/immutable tak diulang). Bisa via env EP_STORE_DSN.
+# (Opsional) Cache Postgres: simpan time_in_status (deep), commit, & TASK ClickUp agar load
+# berikutnya cepat. Task disinkron incremental via date_updated (hanya delta yang ditarik);
+# engineer baru di-backfill sekali sejak `task_backfill_since`. Bisa via env EP_STORE_DSN.
 # Buat dulu database-nya: `createdb engineering_productivity`. Tanpa DSN = mode live (tanpa cache).
 store:
   dsn: ""  # contoh: postgres://localhost:5432/engineering_productivity
+
+# Batas awal backfill cache task (engineer baru ditarik sejak tanggal ini, sekali).
+# Hanya relevan bila store.dsn diisi. Default 2026-05-01.
+task_backfill_since: "2026-05-01"
 
 # Daftar engineer yang mau dianalisis. Boleh pakai email ATAU id numerik.
 # Email akan di-resolve otomatis ke id lewat daftar member workspace.

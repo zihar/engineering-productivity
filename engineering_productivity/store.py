@@ -43,6 +43,23 @@ CREATE TABLE IF NOT EXISTS ep_commit_sync (
     earliest_date  DATE NOT NULL,
     latest_date    DATE NOT NULL
 );
+CREATE TABLE IF NOT EXISTS ep_tasks (
+    task_id       TEXT PRIMARY KEY,
+    payload       JSONB NOT NULL,
+    date_updated  BIGINT,
+    developer_ids BIGINT[],
+    date_done     BIGINT,
+    status_type   TEXT,
+    fetched_at    timestamptz NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS ep_tasks_dev ON ep_tasks USING GIN (developer_ids);
+CREATE TABLE IF NOT EXISTS ep_task_sync (
+    scope     TEXT PRIMARY KEY,
+    watermark BIGINT
+);
+CREATE TABLE IF NOT EXISTS ep_task_backfill (
+    engineer_id BIGINT PRIMARY KEY
+);
 """
 
 
@@ -134,6 +151,75 @@ class Store:
                  "additions": a, "deletions": x}
                 for s, p, e, d, a, x in cur.fetchall()
             ]
+
+    # ------------------------------------------------------------------- tasks
+    def get_task_watermark(self) -> int | None:
+        with self.conn.cursor() as cur:
+            cur.execute("SELECT watermark FROM ep_task_sync WHERE scope = 'global'")
+            row = cur.fetchone()
+            return int(row[0]) if row and row[0] is not None else None
+
+    def set_task_watermark(self, ms: int) -> None:
+        with self.conn.cursor() as cur:
+            cur.execute(
+                """INSERT INTO ep_task_sync (scope, watermark) VALUES ('global', %s)
+                   ON CONFLICT (scope) DO UPDATE SET watermark = EXCLUDED.watermark""",
+                (ms,),
+            )
+
+    def get_backfilled_engineers(self) -> set[int]:
+        with self.conn.cursor() as cur:
+            cur.execute("SELECT engineer_id FROM ep_task_backfill")
+            return {int(r[0]) for r in cur.fetchall()}
+
+    def mark_backfilled(self, ids: list[int]) -> None:
+        if not ids:
+            return
+        with self.conn.cursor() as cur:
+            cur.executemany(
+                "INSERT INTO ep_task_backfill (engineer_id) VALUES (%s) ON CONFLICT (engineer_id) DO NOTHING",
+                [(int(i),) for i in ids],
+            )
+
+    def upsert_tasks(self, rows: list[dict]) -> None:
+        """rows: {task_id, payload(dict), date_updated, developer_ids(list[int]), date_done, status_type}."""
+        if not rows:
+            return
+        prepared = [
+            {
+                "task_id": r["task_id"],
+                "payload": Json(r["payload"]),
+                "date_updated": r.get("date_updated"),
+                "developer_ids": list(r.get("developer_ids") or []),
+                "date_done": r.get("date_done"),
+                "status_type": r.get("status_type"),
+            }
+            for r in rows
+        ]
+        with self.conn.cursor() as cur:
+            cur.executemany(
+                """INSERT INTO ep_tasks (task_id, payload, date_updated, developer_ids, date_done, status_type)
+                   VALUES (%(task_id)s, %(payload)s, %(date_updated)s, %(developer_ids)s, %(date_done)s, %(status_type)s)
+                   ON CONFLICT (task_id) DO UPDATE SET
+                       payload = EXCLUDED.payload,
+                       date_updated = EXCLUDED.date_updated,
+                       developer_ids = EXCLUDED.developer_ids,
+                       date_done = EXCLUDED.date_done,
+                       status_type = EXCLUDED.status_type,
+                       fetched_at = now()""",
+                prepared,
+            )
+
+    def get_tasks(self, developer_ids: list[int]) -> list[dict]:
+        """Kembalikan list payload (dict) untuk task yang punya overlap developer_ids."""
+        if not developer_ids:
+            return []
+        with self.conn.cursor() as cur:
+            cur.execute(
+                "SELECT payload FROM ep_tasks WHERE developer_ids && %s::bigint[]",
+                (list(developer_ids),),
+            )
+            return [row[0] for row in cur.fetchall()]
 
     # ------------------------------------------------------------------- misc
     def commit(self) -> None:

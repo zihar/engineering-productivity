@@ -25,6 +25,7 @@ from engineering_productivity.pipeline import (
     _commits_via_store,
     _coverage_gaps,
     _fetch_time_in_status,
+    _sync_tasks,
     resolve_commit_source,
     resolve_targets,
 )
@@ -337,6 +338,10 @@ class _FakeStore:
         self.puts = 0
         self.commits = {}
         self.coverage = {}
+        # Cache task (Fase 2)
+        self.tasks = {}            # task_id -> row dict
+        self.task_watermark = None
+        self.backfilled = set()
 
     def get_time_in_status(self, ids):
         return {i: self.tis[i] for i in ids if i in self.tis}
@@ -362,6 +367,28 @@ class _FakeStore:
         ps = set(pids)
         return [r for r in self.commits.values()
                 if r["project_id"] in ps and since <= (r["committed_date"] or "")[:10] <= until]
+
+    # --- task cache (Fase 2) ---
+    def get_task_watermark(self):
+        return self.task_watermark
+
+    def set_task_watermark(self, ms):
+        self.task_watermark = ms
+
+    def get_backfilled_engineers(self):
+        return set(self.backfilled)
+
+    def mark_backfilled(self, ids):
+        self.backfilled.update(ids)
+
+    def upsert_tasks(self, rows):
+        for r in rows:
+            self.tasks[r["task_id"]] = dict(r)
+
+    def get_tasks(self, developer_ids):
+        want = set(developer_ids)
+        return [r["payload"] for r in self.tasks.values()
+                if want & set(r.get("developer_ids") or [])]
 
     def commit(self):
         pass
@@ -402,6 +429,69 @@ assert _gl.fetches == 1 and _r1[ID_BUDI].commits == 1, (_gl.fetches, _r1)
 _r2 = _commits_via_store(_gl, _cstore, ["10"], {"budi@x.com": ID_BUDI}, "2024-05-01", "2024-05-31", lambda m: None)
 assert _gl.fetches == 2, _gl.fetches            # +1 fetch: refetch hari terakhir
 assert _r2[ID_BUDI].commits == 1                # dedup by sha → tetap 1
+
+# --- Cache TASK (Fase 2): _sync_tasks backfill + incremental ---
+class _TaskClient:
+    """Fake ClickUp client untuk iter_team_tasks; rekam pemanggilan + params."""
+
+    def __init__(self, by_call):
+        # by_call: list of (matcher_fn, tasks) dipakai berurutan menurut params
+        self.by_call = by_call
+        self.calls = []  # rekam kwargs tiap pemanggilan
+
+    def iter_team_tasks(self, team_id, *, developer_field_id, developer_ids,
+                        date_updated_gt=None, include_closed=True, **kw):
+        self.calls.append({"developer_ids": list(developer_ids),
+                           "date_updated_gt": date_updated_gt})
+        for matcher, tasks in self.by_call:
+            if matcher(developer_ids, date_updated_gt):
+                return iter(tasks)
+        return iter([])
+
+
+def _task(tid, dev, du, dd=None, stype="open"):
+    return {
+        "id": tid,
+        "date_updated": str(du),
+        "date_done": str(dd) if dd is not None else None,
+        "status": {"type": stype, "status": stype},
+        "custom_fields": _dev(dev),
+        "points": "1",
+    }
+
+
+BACKFILL_MS = 1_716_000_000_000
+
+# Run-1 (cold): belum ada backfill → backfill dipanggil untuk new=[101,202],
+# lalu incremental (watermark=BACKFILL_MS). Kedua-duanya dipanggil.
+_ts = _FakeStore()
+_backfill_tasks = [_task("bt1", ID_BUDI, BACKFILL_MS + 10), _task("bt2", ID_SARI, BACKFILL_MS + 20)]
+_incr_tasks_1 = [_task("bt1", ID_BUDI, BACKFILL_MS + 30, dd=BACKFILL_MS + 30, stype="done")]
+_tc = _TaskClient([
+    (lambda d, du: du == BACKFILL_MS and set(d) == {ID_BUDI, ID_SARI} and len(_ts.backfilled) == 0, _backfill_tasks),
+    (lambda d, du: True, _incr_tasks_1),
+])
+_sync_tasks(_tc, _ts, "team", DEV_FIELD, {ID_BUDI, ID_SARI}, BACKFILL_MS, lambda m: None)
+assert _ts.backfilled == {ID_BUDI, ID_SARI}, _ts.backfilled            # keduanya di-backfill
+assert len(_tc.calls) == 2, _tc.calls                                  # 1 backfill + 1 incremental
+assert _tc.calls[0]["date_updated_gt"] == BACKFILL_MS                  # backfill sejak watermark awal
+assert _tc.calls[1]["date_updated_gt"] == BACKFILL_MS                  # incremental: watermark None→backfill
+assert set(_ts.tasks) == {"bt1", "bt2"}, set(_ts.tasks)               # bt1 di-upsert ulang oleh incremental
+assert _ts.task_watermark == BACKFILL_MS + 30, _ts.task_watermark      # watermark = max date_updated
+
+# Run-2 (warm): backfill sudah lengkap → TANPA backfill, hanya incremental dgn developer_ids penuh
+# dan date_updated_gt = watermark sekarang.
+_tc2 = _TaskClient([(lambda d, du: True, [])])  # tak ada delta baru
+_sync_tasks(_tc2, _ts, "team", DEV_FIELD, {ID_BUDI, ID_SARI}, BACKFILL_MS, lambda m: None)
+assert len(_tc2.calls) == 1, _tc2.calls                                # incremental saja, tanpa backfill
+assert sorted(_tc2.calls[0]["developer_ids"]) == [ID_BUDI, ID_SARI]    # developer_ids penuh
+assert _tc2.calls[0]["date_updated_gt"] == BACKFILL_MS + 30, _tc2.calls  # pakai watermark dari run-1
+
+# get_tasks: filter overlap developer benar.
+assert {t["id"] for t in _ts.get_tasks([ID_BUDI])} == {"bt1"}, _ts.get_tasks([ID_BUDI])
+assert {t["id"] for t in _ts.get_tasks([ID_SARI])} == {"bt2"}, _ts.get_tasks([ID_SARI])
+assert {t["id"] for t in _ts.get_tasks([ID_BUDI, ID_SARI])} == {"bt1", "bt2"}
+
 
 md = render_markdown(data, generated_at="2024-05-31 09:00 WIB")
 assert "Selesai terakhir" not in md  # kolom hanya muncul bila fitur aktif

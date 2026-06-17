@@ -91,6 +91,7 @@ class ClickUpClient:
         developer_ids: list[int],
         date_done_gt: int | None = None,
         date_done_lt: int | None = None,
+        date_updated_gt: int | None = None,
         include_closed: bool = True,
         subtasks: bool = True,
     ) -> Iterator[dict]:
@@ -114,6 +115,8 @@ class ClickUpClient:
                 params["date_done_gt"] = date_done_gt
             if date_done_lt is not None:
                 params["date_done_lt"] = date_done_lt
+            if date_updated_gt is not None:
+                params["date_updated_gt"] = date_updated_gt
 
             data = self._get(f"/team/{team_id}/task", params=params)
             tasks = data.get("tasks", [])
