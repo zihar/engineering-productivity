@@ -19,6 +19,8 @@ from .db import fetch_commit_stats as db_fetch_commit_stats
 from .gitlab import GitLabClient, GitLabError, discover_project_ids
 from .gitlab import fetch_commit_stats as gl_fetch_commit_stats
 from .metrics import ReportData, build_report_data
+from .models import CommitStats
+from .store import Store, StoreError
 
 Progress = Callable[[str], None]
 
@@ -125,6 +127,7 @@ def gather_report(
     *,
     client: ClickUpClient | None = None,
     members: list[dict] | None = None,
+    store: Store | None = None,
     progress: Progress = _noop,
 ) -> ReportData:
     """Jalankan seluruh pipeline dan kembalikan ReportData siap render."""
@@ -132,6 +135,17 @@ def gather_report(
     team_id = client.resolve_team_id(config.team_id)
     if members is None:
         members = client.get_members(team_id)
+
+    # Cache DB (opsional): time_in_status + commit. Fallback live bila tak terjangkau.
+    own_store = False
+    if store is None and config.store_dsn:
+        try:
+            store = Store.connect(config.store_dsn)
+            own_store = True
+            progress("[*] Cache DB aktif.")
+        except StoreError as exc:
+            progress(f"    [!] Cache DB nonaktif (live): {exc}")
+            store = None
 
     target_ids, id_to_name = resolve_targets(config, members, progress)
     if not target_ids:
@@ -152,17 +166,7 @@ def gather_report(
     )
     progress(f"[*] {len(tasks)} task selesai ditemukan.")
 
-    time_in_status = None
-    if opts.deep:
-        time_in_status = {}
-        progress(f"[*] Mode deep: mengambil riwayat status {len(tasks)} task ...")
-        for i, task in enumerate(tasks, 1):
-            try:
-                time_in_status[task["id"]] = client.get_time_in_status(task["id"])
-            except ClickUpError as exc:
-                progress(f"    [!] gagal time_in_status {task['id']}: {exc}")
-            if i % 25 == 0:
-                progress(f"    ... {i}/{len(tasks)}")
+    time_in_status = _fetch_time_in_status(client, tasks, store, progress) if opts.deep else None
 
     progress("[*] Menarik time entries ...")
     try:
@@ -196,23 +200,30 @@ def gather_report(
                 )
                 progress(f"    {len(discovered)} repo dari aktivitas push + {len(projects)} dari seed.")
                 projects |= discovered
-            noise_msg = " (filter noise: ambil diff tiap commit, agak lambat)" if opts.exclude_noise else ""
-            progress(f"[*] Menarik commit langsung dari GitLab API ({len(projects)} repo){noise_msg} ...")
             email_map = build_gitlab_email_map(config, members)
-            progress_state = {"n": 0}
+            if store and not opts.exclude_noise:
+                # Jalur cache: fetch hanya rentang yang belum ter-cover, agregasi dari DB.
+                progress(f"[*] Commit GitLab via cache DB ({len(projects)} repo, incremental) ...")
+                commit_stats = _commits_via_store(
+                    gl, store, sorted(projects), email_map, since_str, until_str, progress,
+                )
+            else:
+                noise_msg = " (filter noise: ambil diff tiap commit, agak lambat)" if opts.exclude_noise else ""
+                progress(f"[*] Menarik commit langsung dari GitLab API ({len(projects)} repo){noise_msg} ...")
+                progress_state = {"n": 0}
 
-            def _tick() -> None:
-                progress_state["n"] += 1
-                if progress_state["n"] % 100 == 0:
-                    progress(f"    ... {progress_state['n']} diff diproses")
+                def _tick() -> None:
+                    progress_state["n"] += 1
+                    if progress_state["n"] % 100 == 0:
+                        progress(f"    ... {progress_state['n']} diff diproses")
 
-            commit_stats = gl_fetch_commit_stats(
-                gl, sorted(projects), email_map, since_str, until_str,
-                exclude_noise=opts.exclude_noise,
-                noise_patterns=config.gitlab.noise_patterns,
-                on_warn=progress,
-                on_progress=_tick if opts.exclude_noise else None,
-            )
+                commit_stats = gl_fetch_commit_stats(
+                    gl, sorted(projects), email_map, since_str, until_str,
+                    exclude_noise=opts.exclude_noise,
+                    noise_patterns=config.gitlab.noise_patterns,
+                    on_warn=progress,
+                    on_progress=_tick if opts.exclude_noise else None,
+                )
         except GitLabError as exc:
             progress(f"    [!] Commit GitLab dilewati: {exc}")
             commit_stats = None
@@ -271,7 +282,7 @@ def gather_report(
                     open_tasks_count[aid] = open_tasks_count.get(aid, 0) + 1
                     open_story_points[aid] = open_story_points.get(aid, 0.0) + pts
 
-    return build_report_data(
+    data = build_report_data(
         tasks,
         id_to_name=id_to_name,
         target_ids=target_ids,
@@ -292,3 +303,99 @@ def gather_report(
         open_story_points=open_story_points,
         utilization=opts.utilization,
     )
+    if own_store and store is not None:
+        store.commit()
+        store.close()
+    return data
+
+
+def _fetch_time_in_status(client, tasks: list[dict], store, progress: Progress) -> dict[str, dict]:
+    """Ambil time_in_status tiap task; pakai cache DB bila ada (task done = immutable)."""
+    out: dict[str, dict] = {}
+    cached = store.get_time_in_status([t["id"] for t in tasks]) if store else {}
+    n_cache = n_new = 0
+    progress(f"[*] Mode deep: riwayat status {len(tasks)} task ({len(cached)} dari cache) ...")
+    for task in tasks:
+        tid = task["id"]
+        if tid in cached:
+            out[tid] = cached[tid]
+            n_cache += 1
+            continue
+        try:
+            tis = client.get_time_in_status(tid)
+            out[tid] = tis
+            if store:  # task selesai = immutable → aman disimpan permanen
+                store.put_time_in_status(tid, tis)
+            n_new += 1
+        except ClickUpError as exc:
+            progress(f"    [!] gagal time_in_status {tid}: {exc}")
+        if n_new and n_new % 25 == 0:
+            progress(f"    ... {n_new} ditarik baru")
+    progress(f"    deep: {n_cache} dari cache, {n_new} ditarik baru.")
+    return out
+
+
+def _coverage_gaps(cov: tuple[str, str] | None, since: str, until: str) -> list[tuple[str, str]]:
+    """Rentang [since,until] yang belum ter-cover oleh (earliest,latest). Tanggal YYYY-MM-DD."""
+    if cov is None:
+        return [(since, until)]
+    earliest, latest = cov
+    gaps = []
+    if since < earliest:
+        gaps.append((since, earliest))
+    if until > latest:
+        gaps.append((latest, until))
+    return gaps
+
+
+def _aggregate_commit_rows(rows: list[dict], email_to_engineer: dict[str, int]) -> dict[int, CommitStats]:
+    acc: dict[int, dict] = {}
+    for r in rows:
+        eng = email_to_engineer.get((r.get("author_email") or "").lower())
+        if eng is None:
+            continue
+        a = acc.setdefault(eng, {"commits": 0, "adds": 0, "dels": 0, "days": set(), "repos": set(), "shas": set()})
+        sha = r.get("sha")
+        if sha in a["shas"]:
+            continue
+        a["shas"].add(sha)
+        a["commits"] += 1
+        a["adds"] += int(r.get("additions") or 0)
+        a["dels"] += int(r.get("deletions") or 0)
+        day = (r.get("committed_date") or "")[:10]
+        if day:
+            a["days"].add(day)
+        a["repos"].add(r.get("project_id"))
+    return {
+        eng: CommitStats(commits=a["commits"], additions=a["adds"], deletions=a["dels"],
+                         active_days=len(a["days"]), repos=len(a["repos"]))
+        for eng, a in acc.items()
+    }
+
+
+def _commits_via_store(gl, store, projects, email_map, since, until, progress) -> dict[int, CommitStats]:
+    """Fetch hanya rentang yang belum ter-cover per project, simpan, agregasi dari DB."""
+    fetched = 0
+    for pid in projects:
+        cov = store.get_commit_coverage(pid)
+        for gs, gu in _coverage_gaps(cov, since, until):
+            rows = []
+            try:
+                for c in gl.iter_commits(pid, f"{gs}T00:00:00Z", f"{gu}T23:59:59Z", with_stats=True):
+                    st = c.get("stats") or {}
+                    rows.append({
+                        "sha": c.get("id"), "project_id": str(pid),
+                        "author_email": (c.get("author_email") or "").lower(),
+                        "committed_date": c.get("committed_date") or c.get("created_at"),
+                        "additions": int(st.get("additions") or 0),
+                        "deletions": int(st.get("deletions") or 0),
+                    })
+            except GitLabError as exc:
+                progress(f"    [!] project {pid}: {exc}")
+                continue
+            store.upsert_commits(rows)
+            fetched += len(rows)
+        store.set_commit_coverage(pid, since, until)
+    store.commit()
+    progress(f"    commit: {fetched} ditarik (delta), sisanya dari cache.")
+    return _aggregate_commit_rows(store.get_commits([str(p) for p in projects], since, until), email_map)
