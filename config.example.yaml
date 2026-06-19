@@ -30,6 +30,8 @@ gitlab:
 # (Opsional) Cache Postgres: simpan time_in_status (deep), commit, & TASK ClickUp agar load
 # berikutnya cepat. Task disinkron incremental via date_updated (hanya delta yang ditarik);
 # engineer baru di-backfill sekali sejak `task_backfill_since`. Bisa via env EP_STORE_DSN.
+# Mapping engineer->repo (hasil auto-discover) juga dipersistensi & disinkron incremental,
+# jadi run berikutnya tak perlu scan ulang push-event tiap engineer.
 # Buat dulu database-nya: `createdb engineering_productivity`. Tanpa DSN = mode live (tanpa cache).
 store:
   dsn: ""  # contoh: postgres://localhost:5432/engineering_productivity

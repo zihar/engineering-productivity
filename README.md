@@ -133,6 +133,9 @@ commits (hundreds of calls). Enable the Postgres cache so data is stored and reu
   backfilled once from `task_backfill_since` (default `2026-05-01`); subsequent loads only fetch changed tasks → fast.
   Attribution still via the Developer column.
 - **time_in_status** of *done* tasks (immutable) & **commits** per sha.
+- **engineer→repo discovery**: push-event lookups per engineer are persisted (`ep_engineer_repos`) and synced
+  incrementally (only the uncovered date gap is fetched), so repeat loads skip re-scanning push events. Also powers
+  the per-engineer "repos pushed to" view in the dashboard.
 
 ```bash
 createdb engineering_productivity          # a separate database in your Postgres

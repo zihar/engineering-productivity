@@ -24,6 +24,7 @@ from engineering_productivity.pipeline import (
     _aggregate_commit_rows,
     _commits_via_store,
     _coverage_gaps,
+    _discover_via_store,
     _fetch_time_in_status,
     _sync_tasks,
     resolve_commit_source,
@@ -342,6 +343,9 @@ class _FakeStore:
         self.tasks = {}            # task_id -> row dict
         self.task_watermark = None
         self.backfilled = set()
+        # Discovery engineer->repo
+        self.disc_cov = {}         # email -> (earliest, latest)
+        self.eng_repos = {}        # (email, project_id) -> (first_seen, last_seen)
 
     def get_time_in_status(self, ids):
         return {i: self.tis[i] for i in ids if i in self.tis}
@@ -390,6 +394,31 @@ class _FakeStore:
         return [r["payload"] for r in self.tasks.values()
                 if want & set(r.get("developer_ids") or [])]
 
+    # --- discovery engineer->repo ---
+    def get_discovery_coverage(self, email):
+        return self.disc_cov.get(email.lower())
+
+    def set_discovery_coverage(self, email, e, l):
+        cur = self.disc_cov.get(email.lower())
+        if cur:
+            e, l = min(cur[0], e), max(cur[1], l)
+        self.disc_cov[email.lower()] = (e, l)
+
+    def upsert_engineer_repos(self, rows):
+        for r in rows:
+            key = (r["engineer_email"], r["project_id"])
+            d = r["seen_date"]
+            cur = self.eng_repos.get(key)
+            self.eng_repos[key] = (min(cur[0], d), max(cur[1], d)) if cur else (d, d)
+
+    def get_engineer_repos(self, emails):
+        want = {e.lower() for e in emails}
+        out = {}
+        for (em, pid), (fs, ls) in self.eng_repos.items():
+            if em in want:
+                out.setdefault(em, []).append({"project_id": pid, "first_seen": fs, "last_seen": ls})
+        return out
+
     def commit(self):
         pass
 
@@ -429,6 +458,31 @@ assert _gl.fetches == 1 and _r1[ID_BUDI].commits == 1, (_gl.fetches, _r1)
 _r2 = _commits_via_store(_gl, _cstore, ["10"], {"budi@x.com": ID_BUDI}, "2024-05-01", "2024-05-31", lambda m: None)
 assert _gl.fetches == 2, _gl.fetches            # +1 fetch: refetch hari terakhir
 assert _r2[ID_BUDI].commits == 1                # dedup by sha → tetap 1
+
+# --- Discovery via store: incremental + persist engineer->repo (cermin commits_via_store) ---
+class _GLForDiscovery:
+    def __init__(self):
+        self.event_calls = 0
+
+    def find_user_id(self, *, email=None, name=None):
+        return 1 if email == "budi@x.com" else None
+
+    def iter_push_events(self, uid, after, before):
+        self.event_calls += 1
+        return [{"project_id": 10, "created_at": "2024-05-05T00:00:00Z"},
+                {"project_id": 11, "created_at": "2024-05-06T00:00:00Z"}]
+
+
+_dstore, _gld = _FakeStore(), _GLForDiscovery()
+_p1 = _discover_via_store(_gld, _dstore, [("budi@x.com", "Budi")], "2024-05-01", "2024-05-31", lambda m: None)
+assert _p1 == {"10", "11"}, _p1
+assert _gld.event_calls == 1, _gld.event_calls          # cov None → 1 gap penuh
+# Window sama lagi → hanya hari terakhir di-refetch (1 gap), mapping kumulatif tetap.
+_p2 = _discover_via_store(_gld, _dstore, [("budi@x.com", "Budi")], "2024-05-01", "2024-05-31", lambda m: None)
+assert _gld.event_calls == 2, _gld.event_calls          # +1 gap (hari terakhir)
+assert _p2 == {"10", "11"}, _p2
+_mp = _dstore.get_engineer_repos(["budi@x.com"])
+assert len(_mp["budi@x.com"]) == 2, _mp                 # 2 repo persisted untuk engineer
 
 # --- Cache TASK (Fase 2): _sync_tasks backfill + incremental ---
 class _TaskClient:

@@ -180,6 +180,7 @@ class ReportData:
     last_done_lookback_days: int | None = None
     has_utilization: bool = False
     utilization_signals: list[str] = field(default_factory=list)
+    engineer_repos: dict[str, list[dict]] = field(default_factory=dict)  # nama -> [{project_id, first_seen, last_seen}]
 
 
 # --------------------------------------------------------------------- builder

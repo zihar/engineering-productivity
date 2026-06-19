@@ -224,11 +224,11 @@ def gather_report(
             projects = {str(p) for p in config.gitlab.projects}
             if not opts.no_discover:
                 progress("[*] Auto-discover repo per engineer dari GitLab ...")
-                discovered = discover_project_ids(
-                    gl,
-                    [(e.email, e.name) for e in config.engineers if e.email],
-                    since_str, until_str, on_warn=progress,
-                )
+                eng_pairs = [(e.email, e.name) for e in config.engineers if e.email]
+                if store is not None:
+                    discovered = _discover_via_store(gl, store, eng_pairs, since_str, until_str, progress)
+                else:
+                    discovered = discover_project_ids(gl, eng_pairs, since_str, until_str, on_warn=progress)
                 progress(f"    {len(discovered)} repo dari aktivitas push + {len(projects)} dari seed.")
                 projects |= discovered
             email_map = build_gitlab_email_map(config, members)
@@ -333,6 +333,13 @@ def gather_report(
         open_story_points=open_story_points,
         utilization=opts.utilization,
     )
+    # Mapping engineer->repo dari cache discovery (dibaca walau no_discover aktif).
+    if store is not None and config.gitlab:
+        email_to_name = {e.email.lower(): e.name for e in config.engineers if e.email}
+        raw = store.get_engineer_repos(list(email_to_name))
+        data.engineer_repos = {
+            email_to_name[em]: repos for em, repos in raw.items() if em in email_to_name
+        }
     if own_store and store is not None:
         store.commit()
         store.close()
@@ -495,3 +502,42 @@ def _commits_via_store(gl, store, projects, email_map, since, until, progress) -
     store.commit()
     progress(f"    commit: {fetched} ditarik (delta), sisanya dari cache.")
     return _aggregate_commit_rows(store.get_commits([str(p) for p in projects], since, until), email_map)
+
+
+def _discover_via_store(gl, store, engineers, since, until, progress) -> set[str]:
+    """Discovery repo per engineer dengan cache incremental (cermin _commits_via_store).
+
+    engineers = list[(email, name)]. Hanya tarik push-event untuk rentang gap, simpan
+    mapping engineer->repo, lalu kembalikan union project_id kumulatif dari store.
+    """
+    total_new = 0
+    for email, name in engineers:
+        try:
+            uid = gl.find_user_id(email=email, name=name)
+        except GitLabError as exc:
+            progress(f"    [!] cari user {name}: {exc}")
+            continue
+        if not uid:
+            continue
+        rows: list[dict] = []
+        for gs, gu in _coverage_gaps(store.get_discovery_coverage(email), since, until):
+            after = (datetime.strptime(gs, "%Y-%m-%d") - timedelta(days=1)).strftime("%Y-%m-%d")
+            before = (datetime.strptime(gu, "%Y-%m-%d") + timedelta(days=1)).strftime("%Y-%m-%d")
+            try:
+                for ev in gl.iter_push_events(uid, after, before):
+                    pid = ev.get("project_id")
+                    if pid is None:
+                        continue
+                    day = (ev.get("created_at") or "")[:10]
+                    rows.append({"engineer_email": email.lower(), "project_id": str(pid), "seen_date": day or gs})
+            except GitLabError as exc:
+                progress(f"    [!] events {name}: {exc}")
+                continue
+        store.upsert_engineer_repos(rows)
+        store.set_discovery_coverage(email, since, until)
+        total_new += len(rows)
+    store.commit()
+    mapping = store.get_engineer_repos([e.lower() for e, _ in engineers])
+    project_ids = {r["project_id"] for repos in mapping.values() for r in repos}
+    progress(f"    discovery: {total_new} event delta, {len(project_ids)} repo kumulatif.")
+    return project_ids

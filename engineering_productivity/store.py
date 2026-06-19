@@ -60,6 +60,25 @@ CREATE TABLE IF NOT EXISTS ep_task_sync (
 CREATE TABLE IF NOT EXISTS ep_task_backfill (
     engineer_id BIGINT PRIMARY KEY
 );
+CREATE TABLE IF NOT EXISTS ep_projects (
+    project_id TEXT PRIMARY KEY,
+    path       TEXT,
+    name       TEXT,
+    web_url    TEXT,
+    fetched_at timestamptz NOT NULL DEFAULT now()
+);
+CREATE TABLE IF NOT EXISTS ep_engineer_repos (
+    engineer_email TEXT NOT NULL,
+    project_id     TEXT NOT NULL,
+    first_seen     DATE NOT NULL,
+    last_seen      DATE NOT NULL,
+    PRIMARY KEY (engineer_email, project_id)
+);
+CREATE TABLE IF NOT EXISTS ep_discovery_sync (
+    engineer_email TEXT PRIMARY KEY,
+    earliest_date  DATE NOT NULL,
+    latest_date    DATE NOT NULL
+);
 """
 
 
@@ -152,6 +171,109 @@ class Store:
                 for s, p, e, d, a, x in cur.fetchall()
             ]
 
+    def get_commits_per_repo(
+        self, author_emails: list[str], since_date: str, until_date: str
+    ) -> list[dict]:
+        """Breakdown commit per repo untuk satu set email author (engineer + alias)."""
+        if not author_emails:
+            return []
+        emails = [e.lower() for e in author_emails]
+        with self.conn.cursor() as cur:
+            cur.execute(
+                """SELECT project_id, COUNT(*), COALESCE(SUM(additions), 0),
+                          COALESCE(SUM(deletions), 0),
+                          MIN(committed_date)::text, MAX(committed_date)::text
+                   FROM ep_commits
+                   WHERE lower(author_email) = ANY(%s)
+                     AND committed_date >= %s::date
+                     AND committed_date < (%s::date + INTERVAL '1 day')
+                   GROUP BY project_id
+                   ORDER BY COUNT(*) DESC""",
+                (emails, since_date, until_date),
+            )
+            return [
+                {"project_id": p, "commits": c, "additions": a, "deletions": d,
+                 "first_commit": f, "last_commit": l}
+                for p, c, a, d, f, l in cur.fetchall()
+            ]
+
+    # ---------------------------------------------------------------- projects
+    def get_projects(self, project_ids: list[str]) -> dict[str, dict]:
+        """Kembalikan cache metadata repo {project_id: {path, name, web_url}}."""
+        if not project_ids:
+            return {}
+        with self.conn.cursor() as cur:
+            cur.execute(
+                "SELECT project_id, path, name, web_url FROM ep_projects WHERE project_id = ANY(%s)",
+                (list(project_ids),),
+            )
+            return {
+                pid: {"path": path, "name": name, "web_url": web_url}
+                for pid, path, name, web_url in cur.fetchall()
+            }
+
+    def put_project(self, project_id: str, path: str | None, name: str | None, web_url: str | None) -> None:
+        with self.conn.cursor() as cur:
+            cur.execute(
+                """INSERT INTO ep_projects (project_id, path, name, web_url) VALUES (%s, %s, %s, %s)
+                   ON CONFLICT (project_id) DO UPDATE
+                   SET path = EXCLUDED.path, name = EXCLUDED.name,
+                       web_url = EXCLUDED.web_url, fetched_at = now()""",
+                (project_id, path, name, web_url),
+            )
+
+    # --------------------------------------------------- discovery engineer->repo
+    def get_discovery_coverage(self, email: str) -> tuple[str, str] | None:
+        with self.conn.cursor() as cur:
+            cur.execute(
+                "SELECT earliest_date::text, latest_date::text FROM ep_discovery_sync WHERE engineer_email = %s",
+                (email.lower(),),
+            )
+            row = cur.fetchone()
+            return (row[0], row[1]) if row else None
+
+    def set_discovery_coverage(self, email: str, earliest: str, latest: str) -> None:
+        with self.conn.cursor() as cur:
+            cur.execute(
+                """INSERT INTO ep_discovery_sync (engineer_email, earliest_date, latest_date) VALUES (%s, %s, %s)
+                   ON CONFLICT (engineer_email) DO UPDATE
+                   SET earliest_date = LEAST(ep_discovery_sync.earliest_date, EXCLUDED.earliest_date),
+                       latest_date   = GREATEST(ep_discovery_sync.latest_date, EXCLUDED.latest_date)""",
+                (email.lower(), earliest, latest),
+            )
+
+    def upsert_engineer_repos(self, rows: list[dict]) -> None:
+        """rows = [{engineer_email, project_id, seen_date}] — merge first/last_seen."""
+        if not rows:
+            return
+        with self.conn.cursor() as cur:
+            cur.executemany(
+                """INSERT INTO ep_engineer_repos (engineer_email, project_id, first_seen, last_seen)
+                   VALUES (%(engineer_email)s, %(project_id)s, %(seen_date)s, %(seen_date)s)
+                   ON CONFLICT (engineer_email, project_id) DO UPDATE
+                   SET first_seen = LEAST(ep_engineer_repos.first_seen, EXCLUDED.first_seen),
+                       last_seen  = GREATEST(ep_engineer_repos.last_seen, EXCLUDED.last_seen)""",
+                rows,
+            )
+
+    def get_engineer_repos(self, emails: list[str]) -> dict[str, list[dict]]:
+        """email -> [{project_id, first_seen, last_seen}] urut last_seen desc."""
+        if not emails:
+            return {}
+        with self.conn.cursor() as cur:
+            cur.execute(
+                """SELECT engineer_email, project_id, first_seen::text, last_seen::text
+                   FROM ep_engineer_repos WHERE engineer_email = ANY(%s)
+                   ORDER BY last_seen DESC""",
+                ([e.lower() for e in emails],),
+            )
+            out: dict[str, list[dict]] = {}
+            for email, pid, first_seen, last_seen in cur.fetchall():
+                out.setdefault(email, []).append(
+                    {"project_id": pid, "first_seen": first_seen, "last_seen": last_seen}
+                )
+            return out
+
     # ------------------------------------------------------------------- tasks
     def get_task_watermark(self) -> int | None:
         with self.conn.cursor() as cur:
@@ -218,6 +340,35 @@ class Store:
             cur.execute(
                 "SELECT payload FROM ep_tasks WHERE developer_ids && %s::bigint[]",
                 (list(developer_ids),),
+            )
+            return [row[0] for row in cur.fetchall()]
+
+    def get_open_tasks(self, developer_ids: list[int]) -> list[dict]:
+        """Payload task open/WIP (status belum terminal) untuk developer_ids — snapshot."""
+        if not developer_ids:
+            return []
+        with self.conn.cursor() as cur:
+            cur.execute(
+                """SELECT payload FROM ep_tasks
+                   WHERE developer_ids && %s::bigint[]
+                     AND COALESCE(status_type, '') NOT IN ('closed', 'done')
+                   ORDER BY date_updated DESC NULLS LAST""",
+                (list(developer_ids),),
+            )
+            return [row[0] for row in cur.fetchall()]
+
+    def get_completed_tasks(self, developer_ids: list[int], since_ms: int, until_ms: int) -> list[dict]:
+        """Payload task selesai (date_done dalam rentang epoch-ms) untuk developer_ids."""
+        if not developer_ids:
+            return []
+        with self.conn.cursor() as cur:
+            cur.execute(
+                """SELECT payload FROM ep_tasks
+                   WHERE developer_ids && %s::bigint[]
+                     AND date_done IS NOT NULL
+                     AND date_done >= %s AND date_done <= %s
+                   ORDER BY date_done DESC""",
+                (list(developer_ids), since_ms, until_ms),
             )
             return [row[0] for row in cur.fetchall()]
 
