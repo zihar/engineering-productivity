@@ -113,6 +113,15 @@ class GitLabClient:
                 return res[0]["id"]
         return None
 
+    def get_project(self, project_id: str) -> dict | None:
+        """Metadata satu project: {id, name, path_with_namespace, web_url}. None bila gagal."""
+        pid = quote(str(project_id), safe="")
+        try:
+            data = self._get(f"/api/v4/projects/{pid}", {})
+        except GitLabError:
+            return None
+        return data if isinstance(data, dict) else None
+
     def iter_push_events(self, user_id: int, after: str, before: str):
         """Iterasi event push user (after/before eksklusif, format YYYY-MM-DD)."""
         page = 1

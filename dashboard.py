@@ -23,12 +23,91 @@ import streamlit as st
 # Pastikan paket lokal bisa diimpor apa pun launcher-nya (streamlit run / AppTest).
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from engineering_productivity.config import ConfigError, load_config
+from engineering_productivity.config import Config, ConfigError, load_config
+from engineering_productivity.gitlab import GitLabClient
 from engineering_productivity.metrics import ReportData
 from engineering_productivity.pipeline import GatherOptions, gather_report
 from engineering_productivity.report import render_markdown
+from engineering_productivity.store import Store
 
 CONFIG_PATH = os.environ.get("EP_CONFIG", "config.yaml")
+
+_WIB = timezone(timedelta(hours=7))
+
+
+def _ms_to_date(ms) -> str:
+    """Epoch-ms (string/int) -> 'YYYY-MM-DD' WIB; '' bila kosong."""
+    if ms in (None, "", 0, "0"):
+        return ""
+    try:
+        return datetime.fromtimestamp(int(ms) / 1000, _WIB).strftime("%Y-%m-%d")
+    except (TypeError, ValueError, OSError):
+        return ""
+
+
+def _num(v) -> float:
+    try:
+        return float(v) if v not in (None, "") else 0.0
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _engineer_emails(cfg: Config, name: str) -> list[str]:
+    """Email author commit untuk satu engineer: canonical + alias (lowercase)."""
+    eng = next((e for e in cfg.engineers if e.name == name), None)
+    if not eng or not eng.email:
+        return []
+    canon = eng.email.lower()
+    aliases = cfg.gitlab.aliases.items() if cfg.gitlab else []
+    extra = {a.lower() for a, c in aliases if c.lower() == canon}
+    return sorted({canon} | extra)
+
+
+@st.cache_resource(show_spinner=False)
+def _store(dsn: str):
+    try:
+        return Store.connect(dsn)
+    except Exception:  # noqa: BLE001 — DB tak terjangkau -> detail dinonaktifkan
+        return None
+
+
+@st.cache_data(show_spinner=False)
+def _detail_open(dsn: str, engineer_id: int) -> list[dict]:
+    s = _store(dsn)
+    return s.get_open_tasks([engineer_id]) if s else []
+
+
+@st.cache_data(show_spinner=False)
+def _detail_done(dsn: str, engineer_id: int, since_ms: int, until_ms: int) -> list[dict]:
+    s = _store(dsn)
+    return s.get_completed_tasks([engineer_id], since_ms, until_ms) if s else []
+
+
+@st.cache_data(show_spinner=False)
+def _detail_repos(dsn: str, emails: tuple[str, ...], since: str, until: str) -> list[dict]:
+    s = _store(dsn)
+    return s.get_commits_per_repo(list(emails), since, until) if s else []
+
+
+@st.cache_data(show_spinner="Resolusi nama repo ...")
+def _repo_names(dsn: str, url: str | None, token: str | None, project_ids: tuple[str, ...]) -> dict[str, dict]:
+    """project_id -> {path, web_url}; cache di ep_projects, resolve lazy via GitLab."""
+    s = _store(dsn)
+    if not s or not project_ids:
+        return {}
+    names = dict(s.get_projects(list(project_ids)))
+    missing = [p for p in project_ids if p not in names]
+    if missing and url and token:
+        gl = GitLabClient(url, token)
+        for pid in missing:
+            meta = gl.get_project(pid)
+            if meta:
+                rec = {"path": meta.get("path_with_namespace"), "name": meta.get("name"),
+                       "web_url": meta.get("web_url")}
+                s.put_project(pid, rec["path"], rec["name"], rec["web_url"])
+                names[pid] = rec
+        s.commit()
+    return names
 
 st.set_page_config(page_title="Engineering Productivity", page_icon="📊", layout="wide")
 
@@ -154,8 +233,13 @@ except ConfigError as exc:
     st.stop()
 
 st.sidebar.title("⚙️ Filter")
-all_names = [e.name for e in base_config.engineers]
-sel_names = st.sidebar.multiselect("Engineer", all_names, default=all_names)
+chapters = sorted({e.chapter for e in base_config.engineers if e.chapter})
+if chapters:
+    sel_chapters = st.sidebar.multiselect("Chapter", chapters, default=chapters)
+    names_in_scope = [e.name for e in base_config.engineers if e.chapter in sel_chapters or not e.chapter]
+else:
+    names_in_scope = [e.name for e in base_config.engineers]
+sel_names = st.sidebar.multiselect("Engineer", names_in_scope, default=names_in_scope)
 
 today = date.today()
 default_start = today - timedelta(days=30)
@@ -308,6 +392,110 @@ if extra:
     st.markdown(" · ".join(extra))
 if data.weeks:
     st.bar_chart(pd.Series({w: e.per_week.get(w, 0) for w in data.weeks}))
+
+# --- tab detail: tiket open, tiket selesai, commit per repo (query store on-demand) ---
+_dsn = base_config.store_dsn
+if not _dsn:
+    st.info("Aktifkan `store.dsn` di config.yaml untuk melihat daftar tiket & commit per repo.")
+elif _store(_dsn) is None:
+    st.warning("Store DB tak terjangkau — detail tiket & commit per repo tidak tersedia.")
+else:
+    _gl = base_config.gitlab
+    _gl_url = _gl.url if _gl else None
+    _gl_token = _gl.token if _gl else None
+    tab_open, tab_done, tab_repo, tab_push = st.tabs(
+        ["📋 Tiket open (WIP)", "✅ Tiket selesai", "📦 Commit per repo", "🗂️ Repo (push history)"]
+    )
+
+    with tab_open:
+        opens = _detail_open(_dsn, e.engineer_id)
+        st.caption(f"{len(opens)} tiket open (snapshot, status belum selesai) — engineer sebagai Developer.")
+        if opens:
+            df_open = pd.DataFrame([{
+                "Tiket": t.get("name") or t.get("id"),
+                "Status": (t.get("status") or {}).get("status") or "",
+                "Story point": _num(t.get("points")),
+                "Dibuat": _ms_to_date(t.get("date_created")),
+                "Update terakhir": _ms_to_date(t.get("date_updated")),
+                "Link": t.get("url") or "",
+            } for t in opens])
+            st.dataframe(df_open, width="stretch", hide_index=True, column_config={
+                "Link": st.column_config.LinkColumn("Link", display_text="buka ↗"),
+                "Story point": st.column_config.NumberColumn(format="%.0f"),
+            })
+
+    with tab_done:
+        since_ms = int(datetime.combine(since_d, datetime.min.time(), _WIB).timestamp() * 1000)
+        until_ms = int(datetime.combine(until_d, datetime.max.time(), _WIB).timestamp() * 1000)
+        dones = _detail_done(_dsn, e.engineer_id, since_ms, until_ms)
+        st.caption(f"{len(dones)} tiket selesai pada {data.since} … {data.until}.")
+        if dones:
+            rows_done = []
+            for t in dones:
+                dd = t.get("date_done") or t.get("date_closed")
+                dc = t.get("date_created")
+                lead = None
+                if dd and dc:
+                    try:
+                        lead = round((int(dd) - int(dc)) / 86_400_000, 1)
+                    except (TypeError, ValueError):
+                        lead = None
+                rows_done.append({
+                    "Tiket": t.get("name") or t.get("id"),
+                    "Status": (t.get("status") or {}).get("status") or "",
+                    "Story point": _num(t.get("points")),
+                    "Selesai": _ms_to_date(dd),
+                    "Lead time (hari)": lead,
+                    "Link": t.get("url") or "",
+                })
+            st.dataframe(pd.DataFrame(rows_done), width="stretch", hide_index=True, column_config={
+                "Link": st.column_config.LinkColumn("Link", display_text="buka ↗"),
+                "Story point": st.column_config.NumberColumn(format="%.0f"),
+                "Lead time (hari)": st.column_config.NumberColumn(format="%.1f"),
+            })
+
+    with tab_repo:
+        emails = _engineer_emails(base_config, who)
+        if not emails:
+            st.info("Engineer ini tidak punya email di config — tidak bisa memetakan commit.")
+        else:
+            repos = _detail_repos(_dsn, tuple(emails), data.since, data.until)
+            st.caption(f"{len(repos)} repo dengan commit pada {data.since} … {data.until}. Email: {', '.join(emails)}")
+            if repos:
+                gl = base_config.gitlab
+                names = _repo_names(
+                    _dsn, gl.url if gl else None, gl.token if gl else None,
+                    tuple(r["project_id"] for r in repos),
+                )
+                df_repo = pd.DataFrame([{
+                    "Repo": (names.get(r["project_id"]) or {}).get("path") or f"#{r['project_id']}",
+                    "Commit": r["commits"],
+                    "+baris": r["additions"],
+                    "-baris": r["deletions"],
+                    "Pertama": (r["first_commit"] or "")[:10],
+                    "Terakhir": (r["last_commit"] or "")[:10],
+                    "Link": (names.get(r["project_id"]) or {}).get("web_url") or "",
+                } for r in repos])
+                st.dataframe(df_repo, width="stretch", hide_index=True, column_config={
+                    "Link": st.column_config.LinkColumn("Link", display_text="buka ↗"),
+                })
+
+    with tab_push:
+        pushed = data.engineer_repos.get(who, [])
+        st.caption(f"{len(pushed)} repo pernah di-push (riwayat discovery kumulatif, lintas periode).")
+        if pushed:
+            names = _repo_names(_dsn, _gl_url, _gl_token, tuple(r["project_id"] for r in pushed))
+            df_push = pd.DataFrame([{
+                "Repo": (names.get(r["project_id"]) or {}).get("path") or f"#{r['project_id']}",
+                "Pertama push": r["first_seen"],
+                "Terakhir push": r["last_seen"],
+                "Link": (names.get(r["project_id"]) or {}).get("web_url") or "",
+            } for r in pushed])
+            st.dataframe(df_push, width="stretch", hide_index=True, column_config={
+                "Link": st.column_config.LinkColumn("Link", display_text="buka ↗"),
+            })
+        else:
+            st.caption("Mapping belum tersedia — jalankan sekali dengan auto-discover aktif & store DB.")
 
 # Download Markdown
 now = datetime.now(timezone(timedelta(hours=7)))  # WIB
