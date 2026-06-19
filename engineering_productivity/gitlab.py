@@ -75,7 +75,14 @@ class GitLabClient:
     def _get(self, path: str, params: dict) -> list:
         url = f"{self.base}{path}"
         for attempt in range(self.max_retries):
-            resp = self.session.get(url, params=params, timeout=30)
+            try:
+                resp = self.session.get(url, params=params, timeout=30)
+            except requests.exceptions.RequestException as exc:
+                # timeout / connection reset: retry dengan backoff, jangan matikan run
+                if attempt == self.max_retries - 1:
+                    raise GitLabError(f"GET {path} gagal (jaringan): {exc}")
+                time.sleep(1.5 * (attempt + 1))
+                continue
             if resp.status_code == 429:
                 time.sleep(float(resp.headers.get("Retry-After", "2")) * (attempt + 1))
                 continue

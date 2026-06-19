@@ -64,7 +64,7 @@ def load_config(path: str | Path) -> Config:
 
     raw = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
 
-    token = os.environ.get("CLICKUP_TOKEN") or raw.get("token") or ""
+    token = raw.get("token") or os.environ.get("CLICKUP_TOKEN") or ""
     token = token.strip()
     if not token:
         raise ConfigError(
@@ -89,7 +89,7 @@ def load_config(path: str | Path) -> Config:
     gitlab = _parse_gitlab(raw.get("gitlab") or {})
 
     store_section = raw.get("store") or {}
-    store_dsn = os.environ.get("EP_STORE_DSN") or store_section.get("dsn") or None
+    store_dsn = store_section.get("dsn") or os.environ.get("EP_STORE_DSN") or None
     if store_dsn:
         store_dsn = store_dsn.strip() or None
 
@@ -106,12 +106,12 @@ def load_config(path: str | Path) -> Config:
 
 
 def _parse_gitlab(section: dict) -> GitlabConfig | None:
-    gl_token = os.environ.get("GITLAB_TOKEN") or section.get("token") or ""
+    gl_token = section.get("token") or os.environ.get("GITLAB_TOKEN") or ""
     gl_token = gl_token.strip()
     projects = [str(p) for p in (section.get("projects") or [])]
     url = (section.get("url") or "https://git.bluebird.id").strip()
-    if not gl_token or not projects:
-        return None  # GitLab tidak aktif tanpa token + daftar project
+    if not gl_token:
+        return None  # GitLab tidak aktif tanpa token (projects opsional; auto-discover per engineer)
     aliases = {
         str(k).lower(): str(v).lower()
         for k, v in (section.get("aliases") or {}).items()
