@@ -201,6 +201,7 @@ def gather_report(
 
     commit_stats = None
     commit_source = None
+    repo_names: dict[str, str] = {}
     source = "none" if opts.no_commits else resolve_commit_source(config)
 
     if source == "gitlab":
@@ -209,14 +210,25 @@ def gather_report(
             gl = GitLabClient(config.gitlab.url, config.gitlab.token)
             projects = {str(p) for p in config.gitlab.projects}
             if not opts.no_discover:
-                progress("[*] Auto-discover repo per engineer dari GitLab ...")
-                discovered = discover_project_ids(
-                    gl,
-                    [(e.email, e.name) for e in config.engineers if e.email],
-                    since_str, until_str, on_warn=progress,
-                )
+                eng_pairs = [(e.email, e.name) for e in config.engineers if e.email]
+                if store is not None:
+                    progress("[*] Auto-discover repo (incremental via cache DB) ...")
+                    discovered = _discover_via_store(gl, store, eng_pairs, since_str, until_str, progress)
+                else:
+                    progress("[*] Auto-discover repo per engineer dari GitLab ...")
+                    discovered = discover_project_ids(gl, eng_pairs, since_str, until_str, on_warn=progress)
                 progress(f"    {len(discovered)} repo dari aktivitas push + {len(projects)} dari seed.")
                 projects |= discovered
+
+            # Resolve nama repo + liveness (cache di store). Buang repo mati (404) dari
+            # fetch commit supaya tak boros 1 request/run untuk repo yang sudah dihapus.
+            resolved = _resolve_repos(gl, store, projects, progress)
+            repo_names = {p: r["path"] for p, r in resolved.items() if r.get("path")}
+            dead = {p for p, r in resolved.items() if r.get("alive") is False}
+            if dead:
+                progress(f"    {len(dead)} repo mati (404) di-skip.")
+                projects -= dead
+
             email_map = build_gitlab_email_map(config, members)
             if store and not opts.exclude_noise:
                 # Jalur cache: fetch hanya rentang yang belum ter-cover, agregasi dari DB.
@@ -317,6 +329,7 @@ def gather_report(
         open_tasks=open_tasks_count,
         open_story_points=open_story_points,
         utilization=opts.utilization,
+        repo_names=repo_names,
     )
     if own_store and store is not None:
         store.commit()
@@ -429,27 +442,113 @@ def _coverage_gaps(cov: tuple[str, str] | None, since: str, until: str) -> list[
     return gaps
 
 
+def _discover_via_store(gl, store, engineers, since: str, until: str, progress: Progress) -> set[str]:
+    """Discover repo per engineer secara incremental: hanya scan rentang yang belum
+    ter-cover (mencermin _commits_via_store), persist mapping engineer→repo ke store,
+    lalu kembalikan repo yang aktif di window [since, until] dari cache.
+    """
+    fetched = 0
+    emails: list[str] = []
+    for email, name in engineers:
+        if not email:
+            continue
+        em = email.lower()
+        emails.append(em)
+        try:
+            uid = gl.find_user_id(email=email, name=name)
+        except GitLabError as exc:
+            progress(f"    [!] cari user {name}: {exc}")
+            continue
+        if not uid:
+            progress(f"    [!] user GitLab tak ditemukan: {name}")
+            continue
+        cov = store.get_discovery_coverage(em)
+        for gs, gu in _coverage_gaps(cov, since, until):
+            after = (datetime.strptime(gs, "%Y-%m-%d") - timedelta(days=1)).strftime("%Y-%m-%d")
+            before = (datetime.strptime(gu, "%Y-%m-%d") + timedelta(days=1)).strftime("%Y-%m-%d")
+            rows = []
+            try:
+                for ev in gl.iter_push_events(uid, after, before):
+                    pid = ev.get("project_id")
+                    if pid is None:
+                        continue
+                    day = (ev.get("created_at") or "")[:10] or gu
+                    rows.append({"engineer_email": em, "project_id": str(pid), "seen_date": day})
+            except GitLabError as exc:
+                progress(f"    [!] events {name}: {exc}")
+                continue
+            store.upsert_engineer_repos(rows)
+            fetched += len(rows)
+        store.set_discovery_coverage(em, since, until)
+    store.commit()
+    progress(f"    discover: {fetched} push-event delta; mapping repo dari cache.")
+    # Repo aktif di window = yang last_seen >= since (untuk engineer terpilih).
+    out: set[str] = set()
+    for repos in store.get_engineer_repos(emails).values():
+        for r in repos:
+            if (r.get("last_seen") or "") >= since:
+                out.add(str(r["project_id"]))
+    return out
+
+
+def _resolve_repos(gl, store, pids, progress: Progress) -> dict[str, dict]:
+    """Resolve nama repo (path_with_namespace) + liveness, pakai cache store bila ada.
+
+    404 → ditandai mati (alive=False) supaya tidak di-query lagi. Error transien lain
+    tidak di-cache (dicoba lagi run berikutnya). Mengembalikan {pid: {path, alive}}.
+    """
+    pids = [str(p) for p in pids]
+    cached: dict[str, dict] = dict(store.get_projects(pids)) if store else {}
+    missing = [p for p in pids if p not in cached]
+    if missing:
+        progress(f"[*] Resolve nama {len(missing)} repo baru ...")
+    for pid in missing:
+        path, alive = None, True
+        try:
+            path = gl.get_project_path(pid)
+        except GitLabError as exc:
+            if "404" in str(exc):
+                alive = False  # repo dihapus/tak ada akses → tandai mati, skip ke depan
+            else:
+                progress(f"    [!] nama repo {pid}: {exc}")
+                continue  # transien → jangan cache
+        if store:
+            store.upsert_project(pid, path, alive)
+        cached[pid] = {"path": path, "alive": alive}
+    if store:
+        store.commit()
+    return cached
+
+
 def _aggregate_commit_rows(rows: list[dict], email_to_engineer: dict[str, int]) -> dict[int, CommitStats]:
     acc: dict[int, dict] = {}
     for r in rows:
         eng = email_to_engineer.get((r.get("author_email") or "").lower())
         if eng is None:
             continue
-        a = acc.setdefault(eng, {"commits": 0, "adds": 0, "dels": 0, "days": set(), "repos": set(), "shas": set()})
+        a = acc.setdefault(eng, {"commits": 0, "adds": 0, "dels": 0, "days": set(),
+                                 "repos": set(), "shas": set(), "rows": []})
         sha = r.get("sha")
         if sha in a["shas"]:
             continue
         a["shas"].add(sha)
         a["commits"] += 1
-        a["adds"] += int(r.get("additions") or 0)
-        a["dels"] += int(r.get("deletions") or 0)
+        adds = int(r.get("additions") or 0)
+        dels = int(r.get("deletions") or 0)
+        a["adds"] += adds
+        a["dels"] += dels
         day = (r.get("committed_date") or "")[:10]
         if day:
             a["days"].add(day)
         a["repos"].add(r.get("project_id"))
+        a["rows"].append({
+            "sha": sha, "project_id": str(r.get("project_id")),
+            "committed_date": r.get("committed_date"),
+            "additions": adds, "deletions": dels, "title": r.get("title"),
+        })
     return {
         eng: CommitStats(commits=a["commits"], additions=a["adds"], deletions=a["dels"],
-                         active_days=len(a["days"]), repos=len(a["repos"]))
+                         active_days=len(a["days"]), repos=len(a["repos"]), commit_rows=a["rows"])
         for eng, a in acc.items()
     }
 
@@ -470,6 +569,7 @@ def _commits_via_store(gl, store, projects, email_map, since, until, progress) -
                         "committed_date": c.get("committed_date") or c.get("created_at"),
                         "additions": int(st.get("additions") or 0),
                         "deletions": int(st.get("deletions") or 0),
+                        "title": c.get("title"),
                     })
             except GitLabError as exc:
                 progress(f"    [!] project {pid}: {exc}")

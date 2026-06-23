@@ -24,6 +24,7 @@ from engineering_productivity.pipeline import (
     _aggregate_commit_rows,
     _commits_via_store,
     _coverage_gaps,
+    _discover_via_store,
     _fetch_time_in_status,
     _sync_tasks,
     resolve_commit_source,
@@ -140,6 +141,9 @@ assert data.has_commit_data is True
 assert by_name["Budi"].commits == 20 and by_name["Budi"].active_days == 5, by_name["Budi"].commits
 assert by_name["Budi"].repos_touched == 2, by_name["Budi"].repos_touched
 assert by_name["Sari"].commits == 0, by_name["Sari"].commits
+# Daftar task per engineer (untuk halaman detail): Budi punya t1 & t2.
+assert len(by_name["Budi"].tasks) == 2, by_name["Budi"].tasks
+assert {"id", "name", "status", "date_done", "lead_days", "points", "url"} <= set(by_name["Budi"].tasks[0])
 
 
 # --- Sumber GitLab API langsung (pakai fake client, tanpa network) ---
@@ -169,6 +173,7 @@ assert gb.commits == 3, gb.commits          # a1, a2, b1 (dup a1 & unknown diaba
 assert gb.additions == 18 and gb.deletions == 3, (gb.additions, gb.deletions)
 assert gb.active_days == 2, gb.active_days   # 05-02 & 05-04
 assert gb.repos == 2, gb.repos              # project 100 & 200
+assert len(gb.commit_rows) == 3, gb.commit_rows  # a1, a2, b1 (detail per commit untuk halaman detail)
 
 
 # --- Auto-discover repo per engineer (fake client) ---
@@ -315,6 +320,7 @@ agg = _aggregate_commit_rows([
 ], {"budi@x.com": ID_BUDI})
 ab = agg[ID_BUDI]
 assert (ab.commits, ab.additions, ab.active_days, ab.repos) == (2, 7, 2, 2), (ab.commits, ab.additions, ab.active_days, ab.repos)
+assert len(ab.commit_rows) == 2, ab.commit_rows  # s1 (dedup) + s2
 
 
 class _FakeStore:
@@ -327,6 +333,9 @@ class _FakeStore:
         self.tasks = {}            # task_id -> row dict
         self.task_watermark = None
         self.backfilled = set()
+        # Discovery (engineer→repo)
+        self.discovery = {}        # email -> (earliest, latest)
+        self.eng_repos = {}        # (email, pid) -> [first, last]
 
     def get_time_in_status(self, ids):
         return {i: self.tis[i] for i in ids if i in self.tis}
@@ -374,6 +383,31 @@ class _FakeStore:
         want = set(developer_ids)
         return [r["payload"] for r in self.tasks.values()
                 if want & set(r.get("developer_ids") or [])]
+
+    # --- discovery (engineer→repo) ---
+    def get_discovery_coverage(self, email):
+        return self.discovery.get(email)
+
+    def set_discovery_coverage(self, email, e, l):
+        cur = self.discovery.get(email)
+        if cur:
+            e, l = min(cur[0], e), max(cur[1], l)
+        self.discovery[email] = (e, l)
+
+    def upsert_engineer_repos(self, rows):
+        for r in rows:
+            key = (r["engineer_email"], r["project_id"])
+            d = r["seen_date"]
+            cur = self.eng_repos.get(key)
+            self.eng_repos[key] = [min(cur[0], d), max(cur[1], d)] if cur else [d, d]
+
+    def get_engineer_repos(self, emails):
+        want = set(emails)
+        out = {}
+        for (email, pid), (first, last) in self.eng_repos.items():
+            if email in want:
+                out.setdefault(email, []).append({"project_id": pid, "first_seen": first, "last_seen": last})
+        return out
 
     def commit(self):
         pass
@@ -476,6 +510,30 @@ assert _tc2.calls[0]["date_updated_gt"] == BACKFILL_MS + 30, _tc2.calls  # pakai
 assert {t["id"] for t in _ts.get_tasks([ID_BUDI])} == {"bt1"}, _ts.get_tasks([ID_BUDI])
 assert {t["id"] for t in _ts.get_tasks([ID_SARI])} == {"bt2"}, _ts.get_tasks([ID_SARI])
 assert {t["id"] for t in _ts.get_tasks([ID_BUDI, ID_SARI])} == {"bt1", "bt2"}
+
+
+# --- Discover repo via store: incremental (hanya gap yang di-scan) ---
+class _GLDiscover:
+    def __init__(self):
+        self.event_calls = 0
+
+    def find_user_id(self, *, email=None, name=None):
+        return {"budi@x.com": 11}.get((email or "").lower())
+
+    def iter_push_events(self, uid, after, before):
+        self.event_calls += 1
+        return [{"project_id": 100, "created_at": "2024-05-05T00:00:00Z"},
+                {"project_id": 200, "created_at": "2024-05-06T00:00:00Z"}]
+
+
+_ds, _gld = _FakeStore(), _GLDiscover()
+_dr1 = _discover_via_store(_gld, _ds, [("budi@x.com", "Budi")], "2024-05-01", "2024-05-31", lambda m: None)
+assert _dr1 == {"100", "200"}, _dr1
+assert _gld.event_calls == 1, _gld.event_calls          # 1 gap (full window) di run pertama
+# Run-2 window sama → hanya gap hari terakhir di-scan; mapping dari cache.
+_dr2 = _discover_via_store(_gld, _ds, [("budi@x.com", "Budi")], "2024-05-01", "2024-05-31", lambda m: None)
+assert _gld.event_calls == 2, _gld.event_calls          # +1 call (refetch hari terakhir saja)
+assert _dr2 == {"100", "200"}, _dr2
 
 
 md = render_markdown(data, generated_at="2024-05-31 09:00 WIB")

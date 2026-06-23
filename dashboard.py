@@ -1,112 +1,37 @@
-"""Dashboard Streamlit untuk engineering-productivity.
+"""Dashboard Streamlit untuk engineering-productivity — halaman Overview (tim).
 
 Jalankan:
     export CLICKUP_TOKEN=pk_...        # dan GITLAB_TOKEN=glpat-... bila pakai sumber GitLab
     streamlit run dashboard.py
 
-Membaca config.yaml (atau path di env EP_CONFIG). Memakai pipeline yang sama
-dengan CLI (engineering_productivity.pipeline.gather_report), hasilnya di-cache.
+Membaca config.yaml (atau path di env EP_CONFIG). Filter & fetch dibagi dengan
+halaman lain lewat dashboard_lib (lihat pages/ untuk detail per engineer).
 """
 
 from __future__ import annotations
 
-import dataclasses
-import os
-import sys
-from datetime import date, datetime, timedelta, timezone
-from pathlib import Path
+from datetime import datetime, timedelta, timezone
 
 import pandas as pd
 import plotly.express as px
 import streamlit as st
 
-# Pastikan paket lokal bisa diimpor apa pun launcher-nya (streamlit run / AppTest).
-sys.path.insert(0, str(Path(__file__).resolve().parent))
-
-from engineering_productivity.config import ConfigError, load_config
-from engineering_productivity.metrics import ReportData
-from engineering_productivity.pipeline import GatherOptions, gather_report
-from engineering_productivity.report import render_markdown
-
-CONFIG_PATH = os.environ.get("EP_CONFIG", "config.yaml")
-
 st.set_page_config(page_title="Engineering Productivity", page_icon="📊", layout="wide")
 
-# Sumber data tiap kolom — dipakai sebagai tooltip "?" di header tabel.
-COLUMN_HELP = {
-    "Engineer": "Nama dari daftar engineer (member ClickUp).",
-    "Chapter": "Chapter/disiplin engineer (dari config).",
-    "Selesai": "ClickUp — task berstatus done dengan tanggal selesai dalam periode.",
-    "Selesai terakhir": "ClickUp — tanggal task terakhir berstatus done (lintas periode, mode --last-done).",
-    "Lead median (hari)": "ClickUp — median (tanggal selesai − tanggal dibuat).",
-    "Cycle median (hari)": "ClickUp time_in_status (mode Deep) — median waktu di status aktif.",
-    "Commits": "GitLab — jumlah commit (dicocokkan via email penulis).",
-    "Hari aktif": "GitLab — jumlah hari yang ada commit.",
-    "Repo": "GitLab — jumlah repo yang disentuh.",
-    "+Baris": "GitLab — baris ditambah (mentah, atau tanpa noise bila filter aktif).",
-    "-Baris": "GitLab — baris dihapus (mentah, atau tanpa noise bila filter aktif).",
-    "WIP": "ClickUp — jumlah task open (belum done) yang di-assign ke engineer.",
-    "Story point": "ClickUp — field native 'points' (sprint point) dari task selesai + open.",
-    "Skor": "Dihitung — rata-rata percentile lintas sinyal (0–100; makin rendah = makin underutilized).",
-    "Sinyal rendah": "Sinyal di mana engineer ada di sepertiga terbawah tim.",
-}
+from dashboard_lib import (
+    add_chapter,
+    cols,
+    load_base_config,
+    load_data,
+    render_sidebar,
+    tgl,
+    topn_bar,
+)
+from engineering_productivity.metrics import ReportData
+from engineering_productivity.report import render_markdown
+
 _NUMERIC = {"Selesai", "Lead median (hari)", "Cycle median (hari)", "Commits",
             "Hari aktif", "Repo", "+Baris", "-Baris", "WIP", "Story point"}
-
-
-def cols(df: pd.DataFrame) -> dict:
-    """Bangun column_config (tooltip sumber data + format) untuk kolom yang ada di df."""
-    cfg = {}
-    for c in df.columns:
-        h = COLUMN_HELP.get(c)
-        if c == "Skor":
-            cfg[c] = st.column_config.ProgressColumn(c, help=h, min_value=0, max_value=100, format="%.0f")
-        elif c in _NUMERIC:
-            cfg[c] = st.column_config.NumberColumn(c, help=h)
-        else:
-            cfg[c] = st.column_config.TextColumn(c, help=h)
-    return cfg
-
-
-def add_chapter(df: pd.DataFrame) -> pd.DataFrame:
-    """Sisipkan kolom Chapter (dari config) setelah kolom Engineer."""
-    if "Engineer" in df.columns and "Chapter" not in df.columns:
-        df.insert(1, "Chapter", df["Engineer"].map(NAME_TO_CHAPTER))
-    return df
-
-
-def topn_bar(df: pd.DataFrame, col: str, n: int, top: bool, title: str):
-    """Bar horizontal Top/Bottom-N untuk satu metrik (skalabel ke banyak engineer)."""
-    d = df[["Engineer", col]].dropna().sort_values(col, ascending=not top).head(n)
-    fig = px.bar(d, x=col, y="Engineer", orientation="h", title=title, text=col)
-    fig.update_layout(
-        yaxis={"categoryorder": "total ascending" if top else "total descending"},
-        height=max(280, 26 * len(d) + 80), margin=dict(t=40, b=10),
-    )
-    return fig
-
-
-@st.cache_data(show_spinner="Menarik data dari ClickUp/GitLab ...")
-def gather_cached(
-    config_path: str,
-    engineer_names: tuple[str, ...],
-    since: str,
-    until: str,
-    deep: bool,
-    max_age: int | None,
-    no_discover: bool,
-    exclude_noise: bool,
-    last_done: bool,
-) -> ReportData:
-    cfg = load_config(config_path)
-    if engineer_names:
-        chosen = set(engineer_names)
-        cfg = dataclasses.replace(cfg, engineers=[e for e in cfg.engineers if e.name in chosen])
-    opts = GatherOptions(
-        since=since, until=until, deep=deep, max_age=max_age,
-        no_discover=no_discover, exclude_noise=exclude_noise, last_done=last_done,
-    )  # tz=+7, utilisasi & commit GitLab selalu nyala (default)
-    return gather_report(cfg, opts)
 
 
 def summary_frame(data: ReportData) -> pd.DataFrame:
@@ -152,66 +77,22 @@ def util_frame(data: ReportData) -> pd.DataFrame:
     return df.sort_values("Skor", na_position="last").reset_index(drop=True)
 
 
-# ---------------------------------------------------------------- sidebar
-try:
-    base_config = load_config(CONFIG_PATH)
-except ConfigError as exc:
-    st.error(f"Konfigurasi belum siap: {exc}")
-    st.stop()
-
-st.sidebar.title("⚙️ Filter")
-NAME_TO_CHAPTER = {e.name: (e.chapter or "(tanpa chapter)") for e in base_config.engineers}
-all_chapters = sorted(set(NAME_TO_CHAPTER.values()))
-sel_chapters = st.sidebar.multiselect("Chapter", all_chapters, default=all_chapters,
-                                      help="Skor utilisasi dihitung relatif terhadap engineer yang ter-filter (per chapter).")
-_in_chapter = [n for n, ch in NAME_TO_CHAPTER.items() if ch in sel_chapters]
-sel_names = st.sidebar.multiselect("Engineer", _in_chapter, default=_in_chapter)
-
-today = date.today()
-default_start = today - timedelta(days=30)
-rng = st.sidebar.date_input("Periode", value=(default_start, today), max_value=today)
-if isinstance(rng, tuple) and len(rng) == 2:
-    since_d, until_d = rng
-else:
-    since_d, until_d = default_start, today
-
-deep = st.sidebar.toggle("Deep (cycle time & bottleneck)", value=False, help="Lebih lambat: 1 API call per task")
-max_age_in = st.sidebar.number_input("Abaikan task basi > N hari (0 = nonaktif)", value=60, min_value=0, step=10)
-no_discover = st.sidebar.toggle("Jangan auto-discover repo", value=False)
-exclude_noise = st.sidebar.toggle("Filter file noise (+/- baris)", value=False, help="Lebih lambat: ambil diff tiap commit")
-last_done = st.sidebar.toggle("Tanggal selesai terakhir", value=False, help="Query ekstra: kapan tiap engineer terakhir menutup task (lintas periode)")
-
-if st.sidebar.button("🔄 Refresh data", width="stretch"):
-    gather_cached.clear()
-    st.rerun()
+# ---------------------------------------------------------------- sidebar + data
+base_config = load_base_config()
+filters = render_sidebar(base_config)
+NAME_TO_CHAPTER = filters["name_to_chapter"]
 
 # ---------------------------------------------------------------- body
 st.title("📊 Engineering Productivity")
 
-if not sel_names:
-    st.warning("Pilih minimal satu engineer di sidebar.")
+data = load_data(filters)
+if data is None:
     st.stop()
 
-try:
-    data = gather_cached(
-        CONFIG_PATH, tuple(sel_names),
-        since_d.isoformat(), until_d.isoformat(),
-        deep, (max_age_in or None), no_discover, exclude_noise, last_done,
-    )
-except Exception as exc:  # noqa: BLE001 — tampilkan error apa pun ke UI
-    st.error(f"Gagal menarik data: {exc}")
-    st.stop()
-
-# Periode — caption rapi (tak kepotong seperti di dalam metric)
-_BULAN = ["", "Jan", "Feb", "Mar", "Apr", "Mei", "Jun", "Jul", "Agu", "Sep", "Okt", "Nov", "Des"]
-
-
-def _tgl(iso: str) -> str:
-    y, m, d = iso.split("-")
-    return f"{int(d)} {_BULAN[int(m)]} {y}"
-
-
-st.subheader(f"📅 {_tgl(data.since)} – {_tgl(data.until)}  ·  {(until_d - since_d).days + 1} hari")
+st.subheader(
+    f"📅 {tgl(data.since)} – {tgl(data.until)}  ·  "
+    f"{(filters['until_d'] - filters['since_d']).days + 1} hari"
+)
 
 # KPI — angka saja (3 kolom, tak ada yang terpotong)
 c1, c2, c3 = st.columns(3)
@@ -225,7 +106,7 @@ if data.has_commit_data:
 if data.max_age_days is not None and data.filtered_stale:
     st.caption(f"🧹 {data.filtered_stale} task basi (lead time > {data.max_age_days} hari) diabaikan.")
 
-summary = add_chapter(summary_frame(data))
+summary = add_chapter(summary_frame(data), NAME_TO_CHAPTER)
 emap = {e.name: e for e in data.engineers}
 
 
@@ -234,10 +115,18 @@ def _slider(label, total, key, default=15):
     return st.slider(label, 1, hi, min(default, hi), key=key) if hi > 1 else hi
 
 
+def _open_detail(df: pd.DataFrame, event) -> None:
+    """Bila ada baris terpilih di tabel engineer → buka halaman Detail untuk engineer itu."""
+    rows = event.selection.rows if (event and event.selection) else []
+    if rows:
+        st.session_state["detail_engineer"] = df.iloc[rows[0]]["Engineer"]
+        st.switch_page("pages/1_Detail_Engineer.py")
+
+
 # ===================================================================== 1) UTILIZATION (paling atas)
 st.header("🎯 Engineer Utilization")
 if data.has_utilization:
-    uf = add_chapter(util_frame(data))
+    uf = add_chapter(util_frame(data), NAME_TO_CHAPTER)
     st.caption(
         f"Skor 0–100 relatif tim (sinyal: {', '.join(data.utilization_signals) or '—'}). "
         "Makin rendah = makin underutilized. **Bukan vonis kinerja** — pemicu obrolan kapasitas."
@@ -254,7 +143,10 @@ if data.has_utilization:
         st.plotly_chart(topn_bar(uf, "Skor", n, top=False, title=f"{n} skor terendah"), width="stretch")
     with uc2:
         st.plotly_chart(px.histogram(uf, x="Skor", nbins=10, title="Distribusi skor"), width="stretch")
-    st.dataframe(uf, column_config=cols(uf), width="stretch", hide_index=True)
+    st.caption("👆 Klik baris engineer untuk membuka halaman **Detail Engineer**.")
+    _ev_u = st.dataframe(uf, column_config=cols(uf), width="stretch", hide_index=True,
+                         on_select="rerun", selection_mode="single-row", key="util_select")
+    _open_detail(uf, _ev_u)
 else:
     st.info("Nyalakan **Analisis utilisasi** di sidebar untuk skor utilisasi & daftar engineer underutilized.")
 
@@ -268,7 +160,10 @@ if metric_opts:
     top = m2.radio("Urutan", ["Top", "Bottom"], horizontal=True) == "Top"
     n2 = m3.slider("N", 1, max(1, len(summary)), min(15, len(summary)), key="sum_n") if len(summary) > 1 else 1
     st.plotly_chart(topn_bar(summary, metric, n2, top, f"{'Top' if top else 'Bottom'} {n2} — {metric}"), width="stretch")
-st.dataframe(summary, column_config=cols(summary), width="stretch", hide_index=True)
+st.caption("👆 Klik baris engineer untuk membuka halaman **Detail Engineer**.")
+_ev_s = st.dataframe(summary, column_config=cols(summary), width="stretch", hide_index=True,
+                     on_select="rerun", selection_mode="single-row", key="summary_select")
+_open_detail(summary, _ev_s)
 
 # ===================================================================== 3) MATRIKS TASK vs COMMIT
 if data.has_commit_data:
@@ -292,7 +187,7 @@ if data.has_commit_data:
 if data.weeks:
     st.header("📈 Throughput per minggu (total tim)")
     st.bar_chart(weekly_frame(data).sum(axis=0))
-    st.caption("Total task selesai tim per minggu. Rincian per engineer ada di drill-down di bawah.")
+    st.caption("Total task selesai tim per minggu. Rincian per engineer ada di halaman Detail.")
 
 # ===================================================================== 5) BOTTLENECK
 if data.deep and data.status_flow:
@@ -301,33 +196,6 @@ if data.deep and data.status_flow:
     st.plotly_chart(px.bar(bf.sort_values("Median (jam)"), x="Median (jam)", y="Status",
                            orientation="h", height=max(280, 26 * len(bf) + 80)), width="stretch")
     st.dataframe(bf, width="stretch", hide_index=True)
-
-# ===================================================================== 6) DRILL-DOWN per engineer
-st.header("🔎 Detail per engineer")
-who = st.selectbox("Pilih engineer", [e.name for e in data.engineers])
-e = emap[who]
-d1, d2, d3, d4 = st.columns(4)
-d1.metric("Task selesai", e.completed)
-d2.metric("Commits", e.commits if data.has_commit_data else "—")
-d3.metric("Hari aktif", e.active_days if data.has_commit_data else "—")
-d4.metric("WIP", e.open_tasks if data.has_utilization else "—")
-extra = []
-if data.has_utilization and e.utilization_score is not None:
-    s = f"Skor utilisasi **{e.utilization_score:.0f}**"
-    if e.low_signals:
-        s += f" · sinyal rendah: {', '.join(e.low_signals)}"
-    extra.append(s)
-if data.has_last_done:
-    extra.append(f"Selesai terakhir: **{e.last_done_date or '—'}**")
-if e.cycle_times_days:
-    extra.append(f"Cycle median: **{e.cycle_median}** hari")
-if data.has_commit_data:
-    note = "tanpa noise" if data.commit_noise_filtered else "mentah"
-    extra.append(f"±baris ({note}): +{e.commit_additions}/-{e.commit_deletions} · {e.repos_touched} repo")
-if extra:
-    st.markdown(" · ".join(extra))
-if data.weeks:
-    st.bar_chart(pd.Series({w: e.per_week.get(w, 0) for w in data.weeks}))
 
 # Download Markdown
 now = datetime.now(timezone(timedelta(hours=7)))  # WIB

@@ -142,6 +142,14 @@ class GitLabClient:
                 break
             page += 1
 
+    def get_project_path(self, project: str) -> str | None:
+        """Nama repo (path_with_namespace) untuk satu project id; None bila gagal."""
+        pid = quote(str(project), safe="")
+        data = self._get(f"/api/v4/projects/{pid}", {})
+        if isinstance(data, dict):
+            return data.get("path_with_namespace") or data.get("name")
+        return None
+
     def get_commit_diff(self, project: str, sha: str) -> list[dict]:
         """Diff per file untuk satu commit (dipakai filter noise)."""
         pid = quote(str(project), safe="")
@@ -199,7 +207,8 @@ def discover_project_ids(
 
 
 def _accumulator():
-    return {"commits": 0, "additions": 0, "deletions": 0, "days": set(), "repos": set(), "shas": set()}
+    return {"commits": 0, "additions": 0, "deletions": 0, "days": set(),
+            "repos": set(), "shas": set(), "rows": []}
 
 
 def fetch_commit_stats(
@@ -248,18 +257,23 @@ def fetch_commit_stats(
                         adds = dels = 0
                         if on_warn:
                             on_warn(f"diff {str(sha)[:8]}: {exc}")
-                    a["additions"] += adds
-                    a["deletions"] += dels
                     if on_progress:
                         on_progress()
                 else:
                     stats = c.get("stats") or {}
-                    a["additions"] += int(stats.get("additions") or 0)
-                    a["deletions"] += int(stats.get("deletions") or 0)
-                day = (c.get("committed_date") or c.get("created_at") or "")[:10]
+                    adds = int(stats.get("additions") or 0)
+                    dels = int(stats.get("deletions") or 0)
+                a["additions"] += adds
+                a["deletions"] += dels
+                committed = c.get("committed_date") or c.get("created_at") or ""
+                day = committed[:10]
                 if day:
                     a["days"].add(day)
                 a["repos"].add(str(project))
+                a["rows"].append({
+                    "sha": sha, "project_id": str(project), "committed_date": committed,
+                    "additions": adds, "deletions": dels, "title": c.get("title"),
+                })
         except GitLabError as exc:
             if on_warn:
                 on_warn(f"project {project}: {exc}")
@@ -272,6 +286,7 @@ def fetch_commit_stats(
             deletions=a["deletions"],
             active_days=len(a["days"]),
             repos=len(a["repos"]),
+            commit_rows=a["rows"],
         )
         for eng, a in acc.items()
     }
