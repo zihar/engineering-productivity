@@ -100,6 +100,9 @@ class EngineerStats:
     story_points: float = 0.0                 # Σ poin (task selesai di periode + task open)
     utilization_score: float | None = None    # 0..100 relatif tim (rendah = underutilized)
     low_signals: list[str] = field(default_factory=list)
+    # Detail untuk halaman detail engineer:
+    tasks: list[dict] = field(default_factory=list)        # task selesai di periode (id, name, status, ...)
+    commit_rows: list[dict] = field(default_factory=list)  # commit di periode (sha, project_id, ...)
 
     @property
     def last_done_date(self) -> str | None:
@@ -163,6 +166,9 @@ class ReportData:
     last_done_lookback_days: int | None = None
     has_utilization: bool = False
     utilization_signals: list[str] = field(default_factory=list)
+    repo_names: dict[str, str] = field(default_factory=dict)  # project_id -> path_with_namespace
+    offline: bool = False                # True bila data dari cache DB saja (tanpa fetch live)
+    cache_since: str | None = None       # tanggal terawal data ter-cache (untuk peringatan coverage)
 
 
 # --------------------------------------------------------------------- builder
@@ -185,6 +191,7 @@ def build_report_data(
     open_tasks: dict[int, int] | None = None,
     open_story_points: dict[int, float] | None = None,
     utilization: bool = False,
+    repo_names: dict[str, str] | None = None,
 ) -> ReportData:
     stats: dict[int, EngineerStats] = {
         uid: EngineerStats(engineer_id=uid, name=id_to_name.get(uid, str(uid)))
@@ -232,12 +239,23 @@ def build_report_data(
             _accumulate_status_flow(task, time_in_status, status_flow)
 
         points = _task_points(task)
+        summary = {
+            "id": task.get("id"),
+            "name": task.get("name") or task.get("id"),
+            "status": (st.get("status") or "—").title(),
+            "date_done": local_dt(date_done, tz_offset).strftime("%Y-%m-%d"),
+            "lead_days": lead_days,
+            "cycle_days": cycle_days,
+            "points": points,
+            "url": task.get("url"),
+        }
 
         for d in relevant:
             s = stats[d]
             s.completed += 1
             s.per_week[week] += 1
             s.story_points += points
+            s.tasks.append(summary)
             if lead_days is not None:
                 s.lead_times_days.append(lead_days)
             if cycle_days is not None:
@@ -253,6 +271,7 @@ def build_report_data(
                 s.commit_deletions = cs.deletions
                 s.active_days = cs.active_days
                 s.repos_touched = cs.repos
+                s.commit_rows = cs.commit_rows
 
     # Tanggal task terakhir selesai (lintas periode), bila disediakan pipeline.
     if last_done_ms:
@@ -300,6 +319,7 @@ def build_report_data(
         last_done_lookback_days=last_done_lookback_days,
         has_utilization=utilization,
         utilization_signals=utilization_signals,
+        repo_names=repo_names or {},
     )
 
 

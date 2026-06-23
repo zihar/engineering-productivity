@@ -47,6 +47,7 @@ class GatherOptions:
     last_done: bool = False          # hitung tanggal task terakhir selesai (lintas periode)
     last_done_lookback: int = 365    # batas mundur pencarian last-done (hari)
     utilization: bool = True         # fitur utama: selalu nyala
+    offline: bool = False            # baca dari cache DB saja (tanpa fetch live ClickUp/GitLab)
 
 
 def parse_date(text: str, tz_offset: float, *, end_of_day: bool = False) -> int:
@@ -138,6 +139,25 @@ def gather_report(
     progress: Progress = _noop,
 ) -> ReportData:
     """Jalankan seluruh pipeline dan kembalikan ReportData siap render."""
+    # Mode offline: baca semua dari cache DB, tanpa fetch live (dipakai dashboard
+    # sehari-hari; refresh DB dilakukan job nightly yang jalan dengan offline=False).
+    if opts.offline:
+        if store is None and config.store_dsn:
+            try:
+                store = Store.connect(config.store_dsn)
+                own_store_off = True
+            except StoreError as exc:
+                raise ClickUpError(f"Mode offline butuh cache DB, tapi gagal konek: {exc}") from exc
+        else:
+            own_store_off = False
+        if store is None:
+            raise ClickUpError("Mode offline butuh cache DB (set store.dsn / EP_STORE_DSN).")
+        try:
+            return _gather_offline(config, opts, store, progress)
+        finally:
+            if own_store_off:
+                store.close()
+
     client = client or ClickUpClient(config.token)
     team_id = client.resolve_team_id(config.team_id)
     if members is None:
@@ -159,6 +179,15 @@ def gather_report(
         except StoreError as exc:
             progress(f"    [!] Cache DB nonaktif (live): {exc}")
             store = None
+
+    # Simpan meta workspace ke cache supaya mode offline tak perlu panggil ClickUp.
+    if store is not None:
+        try:
+            store.set_meta("workspace", {"team_id": team_id, "members": members,
+                                         "dev_field_id": dev_field_id})
+            store.commit()
+        except StoreError as exc:
+            progress(f"    [!] gagal simpan meta workspace: {exc}")
 
     target_ids, id_to_name = resolve_targets(config, members, progress)
     if not target_ids:
@@ -201,6 +230,7 @@ def gather_report(
 
     commit_stats = None
     commit_source = None
+    repo_names: dict[str, str] = {}
     source = "none" if opts.no_commits else resolve_commit_source(config)
 
     if source == "gitlab":
@@ -209,14 +239,25 @@ def gather_report(
             gl = GitLabClient(config.gitlab.url, config.gitlab.token)
             projects = {str(p) for p in config.gitlab.projects}
             if not opts.no_discover:
-                progress("[*] Auto-discover repo per engineer dari GitLab ...")
-                discovered = discover_project_ids(
-                    gl,
-                    [(e.email, e.name) for e in config.engineers if e.email],
-                    since_str, until_str, on_warn=progress,
-                )
+                eng_pairs = [(e.email, e.name) for e in config.engineers if e.email]
+                if store is not None:
+                    progress("[*] Auto-discover repo (incremental via cache DB) ...")
+                    discovered = _discover_via_store(gl, store, eng_pairs, since_str, until_str, progress)
+                else:
+                    progress("[*] Auto-discover repo per engineer dari GitLab ...")
+                    discovered = discover_project_ids(gl, eng_pairs, since_str, until_str, on_warn=progress)
                 progress(f"    {len(discovered)} repo dari aktivitas push + {len(projects)} dari seed.")
                 projects |= discovered
+
+            # Resolve nama repo + liveness (cache di store). Buang repo mati (404) dari
+            # fetch commit supaya tak boros 1 request/run untuk repo yang sudah dihapus.
+            resolved = _resolve_repos(gl, store, projects, progress)
+            repo_names = {p: r["path"] for p, r in resolved.items() if r.get("path")}
+            dead = {p for p, r in resolved.items() if r.get("alive") is False}
+            if dead:
+                progress(f"    {len(dead)} repo mati (404) di-skip.")
+                projects -= dead
+
             email_map = build_gitlab_email_map(config, members)
             if store and not opts.exclude_noise:
                 # Jalur cache: fetch hanya rentang yang belum ter-cover, agregasi dari DB.
@@ -317,10 +358,129 @@ def gather_report(
         open_tasks=open_tasks_count,
         open_story_points=open_story_points,
         utilization=opts.utilization,
+        repo_names=repo_names,
     )
+    data.cache_since = config.task_backfill_since if store is not None else None
     if own_store and store is not None:
         store.commit()
         store.close()
+    return data
+
+
+def _gather_offline(config: Config, opts: GatherOptions, store: Store, progress: Progress) -> ReportData:
+    """Bangun ReportData murni dari cache DB — tanpa fetch live ClickUp/GitLab.
+
+    Meta workspace (members, dev_field_id) diambil dari cache; bila belum ada,
+    resolve sekali via ClickUp lalu simpan (one-off ringan).
+    """
+    progress("[*] Mode offline: baca dari cache DB (tanpa fetch live).")
+    meta = store.get_meta("workspace")
+    if not meta or not meta.get("members") or not meta.get("dev_field_id"):
+        progress("    [*] Meta workspace belum ter-cache; resolve sekali via ClickUp ...")
+        client = ClickUpClient(config.token)
+        team_id = client.resolve_team_id(config.team_id)
+        members = client.get_members(team_id)
+        dev_field_id = config.developer_field_id or _resolve_developer_field(
+            client, team_id, config.developer_field_name)
+        store.set_meta("workspace", {"team_id": team_id, "members": members,
+                                     "dev_field_id": dev_field_id})
+        store.commit()
+    else:
+        members = meta["members"]
+        dev_field_id = meta["dev_field_id"]
+
+    target_ids, id_to_name = resolve_targets(config, members, progress)
+    if not target_ids:
+        raise ClickUpError("Tidak ada engineer yang ter-resolve. Periksa daftar engineer di config.")
+
+    since_str, until_str = resolve_window(opts)
+    date_done_gt = parse_date(since_str, opts.tz)
+    date_done_lt = parse_date(until_str, opts.tz, end_of_day=True)
+
+    stored_tasks = store.get_tasks(sorted(target_ids))
+    progress(f"[*] {len(stored_tasks)} task dari cache (semua status).")
+    tasks = [
+        t for t in stored_tasks
+        if (dd := (to_int_ms(t.get("date_done")) or to_int_ms(t.get("date_closed")))) is not None
+        and date_done_gt <= dd <= date_done_lt
+    ]
+    progress(f"[*] {len(tasks)} task selesai ditemukan.")
+
+    time_in_status = store.get_time_in_status([t["id"] for t in tasks]) if opts.deep else None
+
+    # Commit: agregasi langsung dari cache (tanpa GitLab). Set repo = seed ∪ repo
+    # yang pernah ter-discover untuk engineer terpilih (last_seen >= since).
+    commit_stats = None
+    commit_source = None
+    repo_names: dict[str, str] = {}
+    if not opts.no_commits and config.gitlab:
+        emails = [e.email.lower() for e in config.engineers if e.email]
+        projects = {str(p) for p in config.gitlab.projects}
+        for repos in store.get_engineer_repos(emails).values():
+            for r in repos:
+                if (r.get("last_seen") or "") >= since_str:
+                    projects.add(str(r["project_id"]))
+        email_map = build_gitlab_email_map(config, members)
+        rows = store.get_commits(sorted(projects), since_str, until_str)
+        commit_stats = _aggregate_commit_rows(rows, email_map)
+        commit_source = "Cache DB (offline)"
+        resolved = store.get_projects(sorted(projects))
+        repo_names = {p: r["path"] for p, r in resolved.items() if r.get("path")}
+
+    last_done_ms: dict[int, int] | None = None
+    if opts.last_done:
+        lookback_lo = (
+            datetime.strptime(until_str, "%Y-%m-%d") - timedelta(days=opts.last_done_lookback)
+        ).strftime("%Y-%m-%d")
+        lookback_lo_ms = parse_date(lookback_lo, opts.tz)
+        last_done_ms = {}
+        for t in stored_tasks:
+            dd = to_int_ms(t.get("date_done")) or to_int_ms(t.get("date_closed"))
+            if dd is None or dd < lookback_lo_ms or dd > date_done_lt:
+                continue
+            for aid in task_developer_ids(t, dev_field_id):
+                if aid in target_ids and dd > last_done_ms.get(aid, 0):
+                    last_done_ms[aid] = dd
+
+    open_tasks_count: dict[int, int] | None = None
+    open_story_points: dict[int, float] | None = None
+    if opts.utilization:
+        open_tasks_count, open_story_points = {}, {}
+        for t in stored_tasks:
+            if ((t.get("status") or {}).get("type") or "").lower() in TERMINAL_STATUS_TYPES:
+                continue
+            raw = t.get("points")
+            try:
+                pts = float(raw) if raw not in (None, "") else 0.0
+            except (TypeError, ValueError):
+                pts = 0.0
+            for aid in task_developer_ids(t, dev_field_id):
+                if aid in target_ids:
+                    open_tasks_count[aid] = open_tasks_count.get(aid, 0) + 1
+                    open_story_points[aid] = open_story_points.get(aid, 0.0) + pts
+
+    data = build_report_data(
+        tasks,
+        developer_field_id=dev_field_id,
+        id_to_name=id_to_name,
+        target_ids=target_ids,
+        time_in_status=time_in_status,
+        since=since_str,
+        until=until_str,
+        tz_offset=opts.tz,
+        max_age_days=opts.max_age,
+        commit_stats=commit_stats,
+        commit_source=commit_source,
+        commit_noise_filtered=False,
+        last_done_ms=last_done_ms,
+        last_done_lookback_days=opts.last_done_lookback if opts.last_done else None,
+        open_tasks=open_tasks_count,
+        open_story_points=open_story_points,
+        utilization=opts.utilization,
+        repo_names=repo_names,
+    )
+    data.offline = True
+    data.cache_since = config.task_backfill_since
     return data
 
 
@@ -429,27 +589,113 @@ def _coverage_gaps(cov: tuple[str, str] | None, since: str, until: str) -> list[
     return gaps
 
 
+def _discover_via_store(gl, store, engineers, since: str, until: str, progress: Progress) -> set[str]:
+    """Discover repo per engineer secara incremental: hanya scan rentang yang belum
+    ter-cover (mencermin _commits_via_store), persist mapping engineer→repo ke store,
+    lalu kembalikan repo yang aktif di window [since, until] dari cache.
+    """
+    fetched = 0
+    emails: list[str] = []
+    for email, name in engineers:
+        if not email:
+            continue
+        em = email.lower()
+        emails.append(em)
+        try:
+            uid = gl.find_user_id(email=email, name=name)
+        except GitLabError as exc:
+            progress(f"    [!] cari user {name}: {exc}")
+            continue
+        if not uid:
+            progress(f"    [!] user GitLab tak ditemukan: {name}")
+            continue
+        cov = store.get_discovery_coverage(em)
+        for gs, gu in _coverage_gaps(cov, since, until):
+            after = (datetime.strptime(gs, "%Y-%m-%d") - timedelta(days=1)).strftime("%Y-%m-%d")
+            before = (datetime.strptime(gu, "%Y-%m-%d") + timedelta(days=1)).strftime("%Y-%m-%d")
+            rows = []
+            try:
+                for ev in gl.iter_push_events(uid, after, before):
+                    pid = ev.get("project_id")
+                    if pid is None:
+                        continue
+                    day = (ev.get("created_at") or "")[:10] or gu
+                    rows.append({"engineer_email": em, "project_id": str(pid), "seen_date": day})
+            except GitLabError as exc:
+                progress(f"    [!] events {name}: {exc}")
+                continue
+            store.upsert_engineer_repos(rows)
+            fetched += len(rows)
+        store.set_discovery_coverage(em, since, until)
+    store.commit()
+    progress(f"    discover: {fetched} push-event delta; mapping repo dari cache.")
+    # Repo aktif di window = yang last_seen >= since (untuk engineer terpilih).
+    out: set[str] = set()
+    for repos in store.get_engineer_repos(emails).values():
+        for r in repos:
+            if (r.get("last_seen") or "") >= since:
+                out.add(str(r["project_id"]))
+    return out
+
+
+def _resolve_repos(gl, store, pids, progress: Progress) -> dict[str, dict]:
+    """Resolve nama repo (path_with_namespace) + liveness, pakai cache store bila ada.
+
+    404 → ditandai mati (alive=False) supaya tidak di-query lagi. Error transien lain
+    tidak di-cache (dicoba lagi run berikutnya). Mengembalikan {pid: {path, alive}}.
+    """
+    pids = [str(p) for p in pids]
+    cached: dict[str, dict] = dict(store.get_projects(pids)) if store else {}
+    missing = [p for p in pids if p not in cached]
+    if missing:
+        progress(f"[*] Resolve nama {len(missing)} repo baru ...")
+    for pid in missing:
+        path, alive = None, True
+        try:
+            path = gl.get_project_path(pid)
+        except GitLabError as exc:
+            if "404" in str(exc):
+                alive = False  # repo dihapus/tak ada akses → tandai mati, skip ke depan
+            else:
+                progress(f"    [!] nama repo {pid}: {exc}")
+                continue  # transien → jangan cache
+        if store:
+            store.upsert_project(pid, path, alive)
+        cached[pid] = {"path": path, "alive": alive}
+    if store:
+        store.commit()
+    return cached
+
+
 def _aggregate_commit_rows(rows: list[dict], email_to_engineer: dict[str, int]) -> dict[int, CommitStats]:
     acc: dict[int, dict] = {}
     for r in rows:
         eng = email_to_engineer.get((r.get("author_email") or "").lower())
         if eng is None:
             continue
-        a = acc.setdefault(eng, {"commits": 0, "adds": 0, "dels": 0, "days": set(), "repos": set(), "shas": set()})
+        a = acc.setdefault(eng, {"commits": 0, "adds": 0, "dels": 0, "days": set(),
+                                 "repos": set(), "shas": set(), "rows": []})
         sha = r.get("sha")
         if sha in a["shas"]:
             continue
         a["shas"].add(sha)
         a["commits"] += 1
-        a["adds"] += int(r.get("additions") or 0)
-        a["dels"] += int(r.get("deletions") or 0)
+        adds = int(r.get("additions") or 0)
+        dels = int(r.get("deletions") or 0)
+        a["adds"] += adds
+        a["dels"] += dels
         day = (r.get("committed_date") or "")[:10]
         if day:
             a["days"].add(day)
         a["repos"].add(r.get("project_id"))
+        a["rows"].append({
+            "sha": sha, "project_id": str(r.get("project_id")),
+            "committed_date": r.get("committed_date"),
+            "additions": adds, "deletions": dels, "title": r.get("title"),
+        })
     return {
         eng: CommitStats(commits=a["commits"], additions=a["adds"], deletions=a["dels"],
-                         active_days=len(a["days"]), repos=len(a["repos"]))
+                         active_days=len(a["days"]), repos=len(a["repos"]), commit_rows=a["rows"])
         for eng, a in acc.items()
     }
 
@@ -470,6 +716,7 @@ def _commits_via_store(gl, store, projects, email_map, since, until, progress) -
                         "committed_date": c.get("committed_date") or c.get("created_at"),
                         "additions": int(st.get("additions") or 0),
                         "deletions": int(st.get("deletions") or 0),
+                        "title": c.get("title"),
                     })
             except GitLabError as exc:
                 progress(f"    [!] project {pid}: {exc}")

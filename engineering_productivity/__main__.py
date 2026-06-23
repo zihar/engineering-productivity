@@ -16,6 +16,7 @@ from .client import ClickUpClient, ClickUpError
 from .config import ConfigError, load_config
 from .pipeline import GatherOptions, gather_report
 from .report import render_markdown
+from .roster import effective_engineers
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -50,6 +51,9 @@ def main(argv: list[str] | None = None) -> int:
     except ConfigError as exc:
         print(f"[config] {exc}", file=sys.stderr)
         return 2
+
+    # Roster dari DB (seed dari config bila kosong); fallback config tanpa store_dsn.
+    config = dataclasses.replace(config, engineers=effective_engineers(config))
 
     if args.chapter:
         chosen = set(args.chapter)

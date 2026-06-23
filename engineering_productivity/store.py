@@ -35,8 +35,10 @@ CREATE TABLE IF NOT EXISTS ep_commits (
     committed_date timestamptz,
     additions      INT NOT NULL DEFAULT 0,
     deletions      INT NOT NULL DEFAULT 0,
+    title          TEXT,
     fetched_at     timestamptz NOT NULL DEFAULT now()
 );
+ALTER TABLE ep_commits ADD COLUMN IF NOT EXISTS title TEXT;
 CREATE INDEX IF NOT EXISTS ep_commits_proj_date ON ep_commits (project_id, committed_date);
 CREATE TABLE IF NOT EXISTS ep_commit_sync (
     project_id     TEXT PRIMARY KEY,
@@ -59,6 +61,35 @@ CREATE TABLE IF NOT EXISTS ep_task_sync (
 );
 CREATE TABLE IF NOT EXISTS ep_task_backfill (
     engineer_id BIGINT PRIMARY KEY
+);
+CREATE TABLE IF NOT EXISTS ep_engineer_repos (
+    engineer_email TEXT NOT NULL,
+    project_id     TEXT NOT NULL,
+    first_seen     DATE NOT NULL,
+    last_seen      DATE NOT NULL,
+    PRIMARY KEY (engineer_email, project_id)
+);
+CREATE TABLE IF NOT EXISTS ep_discovery_sync (
+    engineer_email TEXT PRIMARY KEY,
+    earliest_date  DATE NOT NULL,
+    latest_date    DATE NOT NULL
+);
+CREATE TABLE IF NOT EXISTS ep_projects (
+    project_id TEXT PRIMARY KEY,
+    path       TEXT,
+    alive      BOOLEAN
+);
+ALTER TABLE ep_projects ADD COLUMN IF NOT EXISTS alive BOOLEAN;
+CREATE TABLE IF NOT EXISTS ep_meta (
+    key   TEXT PRIMARY KEY,
+    value JSONB NOT NULL
+);
+CREATE TABLE IF NOT EXISTS ep_engineers (
+    engineer_id BIGINT PRIMARY KEY,
+    email       TEXT,
+    name        TEXT,
+    chapter     TEXT,
+    active      BOOLEAN NOT NULL DEFAULT TRUE
 );
 """
 
@@ -128,9 +159,9 @@ class Store:
             return
         with self.conn.cursor() as cur:
             cur.executemany(
-                """INSERT INTO ep_commits (sha, project_id, author_email, committed_date, additions, deletions)
-                   VALUES (%(sha)s, %(project_id)s, %(author_email)s, %(committed_date)s, %(additions)s, %(deletions)s)
-                   ON CONFLICT (sha) DO NOTHING""",
+                """INSERT INTO ep_commits (sha, project_id, author_email, committed_date, additions, deletions, title)
+                   VALUES (%(sha)s, %(project_id)s, %(author_email)s, %(committed_date)s, %(additions)s, %(deletions)s, %(title)s)
+                   ON CONFLICT (sha) DO UPDATE SET title = COALESCE(EXCLUDED.title, ep_commits.title)""",
                 rows,
             )
 
@@ -139,7 +170,7 @@ class Store:
             return []
         with self.conn.cursor() as cur:
             cur.execute(
-                """SELECT sha, project_id, author_email, committed_date::text, additions, deletions
+                """SELECT sha, project_id, author_email, committed_date::text, additions, deletions, title
                    FROM ep_commits
                    WHERE project_id = ANY(%s)
                      AND committed_date >= %s::date
@@ -148,8 +179,8 @@ class Store:
             )
             return [
                 {"sha": s, "project_id": p, "author_email": e, "committed_date": d,
-                 "additions": a, "deletions": x}
-                for s, p, e, d, a, x in cur.fetchall()
+                 "additions": a, "deletions": x, "title": t}
+                for s, p, e, d, a, x, t in cur.fetchall()
             ]
 
     # ------------------------------------------------------------------- tasks
@@ -220,6 +251,122 @@ class Store:
                 (list(developer_ids),),
             )
             return [row[0] for row in cur.fetchall()]
+
+    # ---------------------------------------------------- discovery (engineer→repo)
+    def get_discovery_coverage(self, email: str) -> tuple[str, str] | None:
+        with self.conn.cursor() as cur:
+            cur.execute(
+                "SELECT earliest_date::text, latest_date::text FROM ep_discovery_sync WHERE engineer_email = %s",
+                (email,),
+            )
+            row = cur.fetchone()
+            return (row[0], row[1]) if row else None
+
+    def set_discovery_coverage(self, email: str, earliest: str, latest: str) -> None:
+        with self.conn.cursor() as cur:
+            cur.execute(
+                """INSERT INTO ep_discovery_sync (engineer_email, earliest_date, latest_date) VALUES (%s, %s, %s)
+                   ON CONFLICT (engineer_email) DO UPDATE
+                   SET earliest_date = LEAST(ep_discovery_sync.earliest_date, EXCLUDED.earliest_date),
+                       latest_date   = GREATEST(ep_discovery_sync.latest_date, EXCLUDED.latest_date)""",
+                (email, earliest, latest),
+            )
+
+    def upsert_engineer_repos(self, rows: list[dict]) -> None:
+        """rows: {engineer_email, project_id, seen_date} — merge first/last_seen."""
+        if not rows:
+            return
+        with self.conn.cursor() as cur:
+            cur.executemany(
+                """INSERT INTO ep_engineer_repos (engineer_email, project_id, first_seen, last_seen)
+                   VALUES (%(engineer_email)s, %(project_id)s, %(seen_date)s, %(seen_date)s)
+                   ON CONFLICT (engineer_email, project_id) DO UPDATE
+                   SET first_seen = LEAST(ep_engineer_repos.first_seen, EXCLUDED.first_seen),
+                       last_seen  = GREATEST(ep_engineer_repos.last_seen, EXCLUDED.last_seen)""",
+                rows,
+            )
+
+    def get_engineer_repos(self, emails: list[str]) -> dict[str, list[dict]]:
+        """email -> [{project_id, first_seen, last_seen}] untuk daftar email diberikan."""
+        if not emails:
+            return {}
+        with self.conn.cursor() as cur:
+            cur.execute(
+                """SELECT engineer_email, project_id, first_seen::text, last_seen::text
+                   FROM ep_engineer_repos WHERE engineer_email = ANY(%s)""",
+                (list(emails),),
+            )
+            out: dict[str, list[dict]] = {}
+            for email, pid, first, last in cur.fetchall():
+                out.setdefault(email, []).append(
+                    {"project_id": pid, "first_seen": first, "last_seen": last}
+                )
+            return out
+
+    # ----------------------------------------------------------- project (nama repo)
+    def get_projects(self, ids: list[str]) -> dict[str, dict]:
+        """project_id -> {path, alive} untuk id yang sudah pernah di-resolve."""
+        if not ids:
+            return {}
+        with self.conn.cursor() as cur:
+            cur.execute(
+                "SELECT project_id, path, alive FROM ep_projects WHERE project_id = ANY(%s)",
+                ([str(i) for i in ids],),
+            )
+            return {p: {"path": path, "alive": alive} for p, path, alive in cur.fetchall()}
+
+    def upsert_project(self, project_id: str, path: str | None, alive: bool) -> None:
+        with self.conn.cursor() as cur:
+            cur.execute(
+                """INSERT INTO ep_projects (project_id, path, alive) VALUES (%s, %s, %s)
+                   ON CONFLICT (project_id) DO UPDATE
+                   SET path = COALESCE(EXCLUDED.path, ep_projects.path), alive = EXCLUDED.alive""",
+                (str(project_id), path, alive),
+            )
+
+    # -------------------------------------------------------------- meta (workspace)
+    def get_meta(self, key: str) -> dict | None:
+        with self.conn.cursor() as cur:
+            cur.execute("SELECT value FROM ep_meta WHERE key = %s", (key,))
+            row = cur.fetchone()
+            return row[0] if row else None
+
+    def set_meta(self, key: str, value: dict) -> None:
+        with self.conn.cursor() as cur:
+            cur.execute(
+                """INSERT INTO ep_meta (key, value) VALUES (%s, %s)
+                   ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value""",
+                (key, Json(value)),
+            )
+
+    # ----------------------------------------------------- roster (engineer + chapter)
+    def get_engineers(self, active_only: bool = True) -> list[dict]:
+        sql = "SELECT engineer_id, email, name, chapter, active FROM ep_engineers"
+        if active_only:
+            sql += " WHERE active"
+        sql += " ORDER BY name"
+        with self.conn.cursor() as cur:
+            cur.execute(sql)
+            return [{"engineer_id": i, "email": e, "name": n, "chapter": c, "active": a}
+                    for i, e, n, c, a in cur.fetchall()]
+
+    def upsert_engineers(self, rows: list[dict]) -> None:
+        """rows: {engineer_id, email, name, chapter, active}."""
+        if not rows:
+            return
+        with self.conn.cursor() as cur:
+            cur.executemany(
+                """INSERT INTO ep_engineers (engineer_id, email, name, chapter, active)
+                   VALUES (%(engineer_id)s, %(email)s, %(name)s, %(chapter)s, %(active)s)
+                   ON CONFLICT (engineer_id) DO UPDATE SET
+                       email = EXCLUDED.email, name = EXCLUDED.name,
+                       chapter = EXCLUDED.chapter, active = EXCLUDED.active""",
+                rows,
+            )
+
+    def get_workspace_members(self) -> list[dict]:
+        """Daftar member workspace dari cache meta (untuk editor roster)."""
+        return (self.get_meta("workspace") or {}).get("members") or []
 
     # ------------------------------------------------------------------- misc
     def commit(self) -> None:
