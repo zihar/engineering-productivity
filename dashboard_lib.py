@@ -141,24 +141,24 @@ def render_topbar(base_config) -> dict:
     st.session_state.setdefault("flt_period", (today - timedelta(days=30), today))
     st.session_state.setdefault("flt_live", False)
 
-    with st.container(border=True):
-        c1, c2, c3, c4 = st.columns([2, 3, 2.2, 1.4], vertical_alignment="bottom")
-        with c1:
-            sel_chapters = st.multiselect("Chapter", all_chapters, key="flt_chapters",
-                                          placeholder="Semua chapter")
+    # Badge jumlah engineer terpilih (dari run sebelumnya) di label tombol.
+    n_eng = len(st.session_state.get("flt_engineers", []) or [])
+    label = f"⚙️  Filter · {n_eng}" if n_eng else "⚙️  Filter"
+
+    with st.popover(label, use_container_width=True):
+        sel_chapters = st.multiselect("Chapter", all_chapters, key="flt_chapters",
+                                      placeholder="Semua chapter")
         in_chapter = [n for n, ch in name_to_chapter.items() if ch in sel_chapters]
         st.session_state.setdefault("flt_engineers", in_chapter)
         st.session_state["flt_engineers"] = [n for n in st.session_state["flt_engineers"] if n in in_chapter]
-        with c2:
-            sel_names = st.multiselect("Engineer", in_chapter, key="flt_engineers",
-                                       placeholder="Pilih engineer")
-        with c3:
-            rng = st.date_input("Periode", max_value=today, key="flt_period")
-        with c4:
-            live = st.toggle("🛰️ Data live", key="flt_live",
-                             help="Default baca cache DB (cepat, di-refresh tiap malam). "
-                                  "Nyalakan untuk data terbaru / periode di luar cache.")
-            refresh = st.button("🔄 Refresh", width="stretch")
+        sel_names = st.multiselect("Engineer", in_chapter, key="flt_engineers",
+                                   placeholder="Pilih engineer")
+        rng = st.date_input("Periode", max_value=today, key="flt_period")
+        st.divider()
+        live = st.toggle("🛰️ Tarik data live", key="flt_live",
+                         help="Default baca cache DB (cepat, di-refresh tiap malam). "
+                              "Nyalakan untuk data terbaru / memuat periode di luar cache.")
+        refresh = st.button("🔄 Refresh data", width="stretch")
 
     if isinstance(rng, (tuple, list)) and len(rng) == 2:
         since_d, until_d = rng

@@ -62,6 +62,13 @@ st.markdown(
 
       /* Segmented control (pemilih tampilan) sedikit lebih lega. */
       [data-testid="stSegmentedControl"] button {padding: 6px 18px;}
+
+      /* Tombol Filter (popover) jadi pill rapi ber-aksen. */
+      [data-testid="stPopover"] button {
+        border-radius: 10px; border: 1px solid #CBD5E1;
+        font-weight: 600; color: #2563EB;
+      }
+      [data-testid="stPopover"] button:hover {border-color: #2563EB; background: #EFF4FF;}
     </style>
     """,
     unsafe_allow_html=True,
@@ -341,27 +348,28 @@ def render_detail(data: ReportData, name_to_chapter: dict) -> None:
 
 
 # ============================================================================ app
-st.title("📊 Engineering Productivity")
-
 base_config = load_base_config()
-filters = render_topbar(base_config)
+
+h_title, h_filter, h_view = st.columns([6, 1.7, 2.6], vertical_alignment="center")
+with h_title:
+    st.markdown("## 📊 Engineering Productivity")
+with h_filter:
+    filters = render_topbar(base_config)
+with h_view:
+    st.session_state.setdefault("view", VIEW_TEAM)
+    view = st.segmented_control("Tampilan", [VIEW_TEAM, VIEW_DETAIL],
+                                key="view", label_visibility="collapsed")
 NAME_TO_CHAPTER = filters["name_to_chapter"]
 
 data = load_data(filters)
 if data is None:
     st.stop()
 
-hc1, hc2 = st.columns([3, 2], vertical_alignment="center")
-with hc1:
-    st.markdown(f"#### 📅 {tgl(data.since)} – {tgl(data.until)}  ·  "
-                f"{(filters['until_d'] - filters['since_d']).days + 1} hari")
-    coverage_note(data, filters)
-with hc2:
-    st.session_state.setdefault("view", VIEW_TEAM)
-    view = st.segmented_control("Tampilan", [VIEW_TEAM, VIEW_DETAIL],
-                                key="view", label_visibility="collapsed")
-
+st.markdown(f"📅 **{tgl(data.since)} – {tgl(data.until)}**  ·  "
+            f"{(filters['until_d'] - filters['since_d']).days + 1} hari")
+coverage_note(data, filters)
 st.divider()
+
 if not data.engineers:
     st.warning("Tidak ada engineer pada filter ini.")
 elif view == VIEW_DETAIL:
