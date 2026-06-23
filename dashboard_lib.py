@@ -23,6 +23,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from engineering_productivity.config import ConfigError, load_config
 from engineering_productivity.metrics import ReportData
 from engineering_productivity.pipeline import GatherOptions, gather_report
+from engineering_productivity.roster import effective_engineers
+from engineering_productivity.store import Store, StoreError
 
 CONFIG_PATH = os.environ.get("EP_CONFIG", "config.yaml")
 
@@ -102,6 +104,7 @@ def gather_cached(
     offline: bool,
 ) -> ReportData:
     cfg = load_config(config_path)
+    cfg = dataclasses.replace(cfg, engineers=effective_engineers(cfg))  # roster dari DB
     if engineer_names:
         chosen = set(engineer_names)
         cfg = dataclasses.replace(cfg, engineers=[e for e in cfg.engineers if e.name in chosen])
@@ -114,12 +117,75 @@ def gather_cached(
 
 
 def load_base_config():
-    """Muat config dasar (semua engineer); hentikan halaman dgn pesan bila gagal."""
+    """Muat config dasar + roster engineer dari DB; hentikan halaman bila gagal."""
     try:
-        return load_config(CONFIG_PATH)
+        cfg = load_config(CONFIG_PATH)
     except ConfigError as exc:
         st.error(f"Konfigurasi belum siap: {exc}")
         st.stop()
+    return dataclasses.replace(cfg, engineers=effective_engineers(cfg))
+
+
+def render_roster_editor(config) -> None:
+    """Popover '👥 Tim': kelola anggota tim + chapter (tersimpan ke DB)."""
+    with st.popover("👥  Tim", use_container_width=True):
+        if not config.store_dsn:
+            st.info("Roster di DB butuh cache aktif (store.dsn).")
+            return
+        try:
+            store = Store.connect(config.store_dsn)
+        except StoreError as exc:
+            st.error(f"Gagal konek DB: {exc}")
+            return
+        try:
+            roster = store.get_engineers(active_only=False)
+            members = store.get_workspace_members()
+        finally:
+            store.close()
+
+        st.caption("Centang **Aktif** untuk tampil di dashboard, isi **Chapter**, lalu Simpan.")
+        if roster:
+            df = pd.DataFrame(roster)[["engineer_id", "name", "email", "chapter", "active"]]
+            df["chapter"] = df["chapter"].fillna("")
+            edited = st.data_editor(
+                df, hide_index=True, width="stretch", num_rows="fixed", key="roster_editor",
+                column_config={
+                    "engineer_id": None,  # sembunyikan
+                    "name": st.column_config.TextColumn("Nama", disabled=True),
+                    "email": st.column_config.TextColumn("Email", disabled=True),
+                    "chapter": st.column_config.TextColumn("Chapter"),
+                    "active": st.column_config.CheckboxColumn("Aktif"),
+                },
+            )
+        else:
+            edited = pd.DataFrame(columns=["engineer_id", "name", "email", "chapter", "active"])
+            st.caption("Belum ada anggota — tambahkan dari daftar member di bawah.")
+
+        existing = {int(r["engineer_id"]) for r in roster}
+        opts = {f'{m.get("username") or m.get("email")} — {m.get("email") or ""}': m
+                for m in members if int(m.get("id")) not in existing}
+        to_add = st.multiselect("Tambah engineer dari workspace", sorted(opts), placeholder="Cari nama/email")
+
+        if st.button("💾 Simpan", type="primary", width="stretch"):
+            rows = [{
+                "engineer_id": int(r.engineer_id), "email": r.email, "name": r.name,
+                "chapter": (r.chapter or "").strip() or None, "active": bool(r.active),
+            } for r in edited.itertuples()]
+            for key in to_add:
+                m = opts[key]
+                rows.append({"engineer_id": int(m["id"]), "email": m.get("email"),
+                             "name": m.get("username") or m.get("email"), "chapter": None, "active": True})
+            try:
+                s2 = Store.connect(config.store_dsn)
+                s2.upsert_engineers(rows)
+                s2.commit()
+                s2.close()
+            except StoreError as exc:
+                st.error(f"Gagal simpan: {exc}")
+                return
+            gather_cached.clear()
+            st.success(f"{len(rows)} engineer tersimpan.")
+            st.rerun()
 
 
 def render_topbar(base_config) -> dict:

@@ -84,6 +84,13 @@ CREATE TABLE IF NOT EXISTS ep_meta (
     key   TEXT PRIMARY KEY,
     value JSONB NOT NULL
 );
+CREATE TABLE IF NOT EXISTS ep_engineers (
+    engineer_id BIGINT PRIMARY KEY,
+    email       TEXT,
+    name        TEXT,
+    chapter     TEXT,
+    active      BOOLEAN NOT NULL DEFAULT TRUE
+);
 """
 
 
@@ -331,6 +338,35 @@ class Store:
                    ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value""",
                 (key, Json(value)),
             )
+
+    # ----------------------------------------------------- roster (engineer + chapter)
+    def get_engineers(self, active_only: bool = True) -> list[dict]:
+        sql = "SELECT engineer_id, email, name, chapter, active FROM ep_engineers"
+        if active_only:
+            sql += " WHERE active"
+        sql += " ORDER BY name"
+        with self.conn.cursor() as cur:
+            cur.execute(sql)
+            return [{"engineer_id": i, "email": e, "name": n, "chapter": c, "active": a}
+                    for i, e, n, c, a in cur.fetchall()]
+
+    def upsert_engineers(self, rows: list[dict]) -> None:
+        """rows: {engineer_id, email, name, chapter, active}."""
+        if not rows:
+            return
+        with self.conn.cursor() as cur:
+            cur.executemany(
+                """INSERT INTO ep_engineers (engineer_id, email, name, chapter, active)
+                   VALUES (%(engineer_id)s, %(email)s, %(name)s, %(chapter)s, %(active)s)
+                   ON CONFLICT (engineer_id) DO UPDATE SET
+                       email = EXCLUDED.email, name = EXCLUDED.name,
+                       chapter = EXCLUDED.chapter, active = EXCLUDED.active""",
+                rows,
+            )
+
+    def get_workspace_members(self) -> list[dict]:
+        """Daftar member workspace dari cache meta (untuk editor roster)."""
+        return (self.get_meta("workspace") or {}).get("members") or []
 
     # ------------------------------------------------------------------- misc
     def commit(self) -> None:

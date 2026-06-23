@@ -25,6 +25,7 @@ from dashboard_lib import (
     coverage_note,
     load_base_config,
     load_data,
+    render_roster_editor,
     render_topbar,
     tgl,
     topn_bar,
@@ -350,9 +351,11 @@ def render_detail(data: ReportData, name_to_chapter: dict) -> None:
 # ============================================================================ app
 base_config = load_base_config()
 
-h_title, h_filter, h_view = st.columns([6, 1.7, 2.6], vertical_alignment="center")
+h_title, h_team, h_filter, h_view = st.columns([5, 1.4, 1.7, 2.6], vertical_alignment="center")
 with h_title:
     st.markdown("## 📊 Engineering Productivity")
+with h_team:
+    render_roster_editor(base_config)
 with h_filter:
     filters = render_topbar(base_config)
 with h_view:
